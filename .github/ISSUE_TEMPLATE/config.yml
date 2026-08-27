@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: The machine will not boot
+    url: https://github.com/doug445/LinuxLocker/blob/main/docs/RECOVERY.md
+    about: Interrupted encryption, corrupt headers, unbootable systems. Most cases are already documented here — read this first.
+  - name: Security vulnerability
+    url: https://github.com/doug445/LinuxLocker/blob/main/SECURITY.md
+    about: Do not open a public issue. Report privately by email — see SECURITY.md.
+  - name: What this project accepts
+    url: https://github.com/doug445/LinuxLocker/blob/main/CONTRIBUTING.md
+    about: Serious bugs and new filesystem support, and nothing else. Read before opening anything.
+  - name: Which filesystems are supported, and why
+    url: https://github.com/doug445/LinuxLocker/blob/main/docs/FILESYSTEMS.md
+    about: The full matrix, the 32 MiB shrink rule, and the workarounds for xfs, exfat, udf and swap.

@@ -1,0 +1,88 @@
+name: Filesystem support
+description: A filesystem this tool should be able to encrypt in place, and cannot
+labels: ["filesystem"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project takes serious bugs and new filesystem support — this is the
+        second one. Anything else (new options, refactors, general feature
+        requests) will be declined regardless of quality; see
+        [`CONTRIBUTING.md`](https://github.com/doug445/LinuxLocker/blob/main/CONTRIBUTING.md)
+        for why.
+
+        Check
+        [`docs/FILESYSTEMS.md`](https://github.com/doug445/LinuxLocker/blob/main/docs/FILESYSTEMS.md)
+        first. A filesystem is supportable **in place** only when it can be shrunk
+        by 32 MiB for the LUKS2 header, or already has that much slack. Some are
+        listed there as deliberate refusals with a documented workaround — a
+        refusal is a supported outcome, not a gap.
+
+  - type: input
+    id: fstype
+    attributes:
+      label: Which filesystem
+      placeholder: "bcachefs"
+    validations:
+      required: true
+
+  - type: input
+    id: shrink_tool
+    attributes:
+      label: What shrinks it, and can it shrink offline?
+      description: >
+        The tool and the flags. If nothing can shrink it, say so — that makes it
+        a slack-only candidate at best, the way xfs is handled.
+      placeholder: "bcachefs device resize, online only, needs the fs mounted"
+    validations:
+      required: true
+
+  - type: input
+    id: size_probe
+    attributes:
+      label: What reports its size without mounting it?
+      description: >
+        Required for the idempotency guard, which has to tell "not yet shrunk"
+        from "already shrunk" on a re-run. `dumpe2fs` and `btrfs inspect-internal`
+        are the existing examples.
+      placeholder: "bcachefs show-super, field ..."
+    validations:
+      required: true
+
+  - type: input
+    id: packages
+    attributes:
+      label: Package names, per distro
+      description: What `bin/lib-deps.sh` would have to install, for as many package managers as you know.
+      placeholder: "Fedora: bcachefs-tools · Debian: bcachefs-tools · Arch: bcachefs-tools"
+
+  - type: dropdown
+    id: usecase
+    attributes:
+      label: Root filesystem or data partition?
+      options:
+        - Root filesystem — full boot configuration needed
+        - Data partition only — encrypt, recovery key, header backup
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: tested
+    attributes:
+      label: What you have actually tested
+      description: >
+        A shrink / grow cycle against a loop device is worth more here than
+        anything else you can write. Say what you ran and what happened,
+        including the sizes before and after.
+      render: shell
+
+  - type: checkboxes
+    id: confirms
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have read `docs/FILESYSTEMS.md` and this filesystem is not already classified there.
+          required: true
+        - label: I understand a handler needs an offline size probe, a bounded shrink, a grow-back, and a leg in `tests/loopback-core-test.sh` before it can merge.
+          required: true
