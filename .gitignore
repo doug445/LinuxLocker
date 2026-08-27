@@ -1,0 +1,12 @@
+# Deployment artifacts — never commit these, they contain machine identity
+luks-deploy-*.log
+pre-luks-state-*/
+LUKS-RECOVERY-*/
+*.img
+*.header
+post-encryption.conf
+*.bak
+*.tmp
+
+# Local SEO / launch scratch — not published
+github-about.txt

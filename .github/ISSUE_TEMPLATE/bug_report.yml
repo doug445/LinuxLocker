@@ -1,0 +1,151 @@
+name: Bug report
+description: Data loss, an unbootable system, or a check that reported the wrong thing
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This tooling rewrites a live root filesystem and its bootloader**, so a
+        description of what went wrong is rarely enough to act on. The fields
+        below are what is.
+
+        > ### Never paste key material
+        > **Never post the output of `luksDump --dump-master-key`, and never
+        > upload a header backup image.** Either one hands over your disk. Plain
+        > `cryptsetup luksDump` is safe — cipher, KDF and slot metadata only.
+
+        This project takes serious bugs and new filesystem support, and nothing
+        else — see
+        [`CONTRIBUTING.md`](https://github.com/doug445/LinuxLocker/blob/main/CONTRIBUTING.md).
+        If the machine will not boot, read
+        [`docs/RECOVERY.md`](https://github.com/doug445/LinuxLocker/blob/main/docs/RECOVERY.md)
+        first; most cases are already covered there.
+
+  - type: input
+    id: distro_from
+    attributes:
+      label: Which live environment you ran it FROM
+      description: The distro and version of the live/rescue system, and its `cryptsetup --version`.
+      placeholder: "Arch live ISO 2026.08.01, cryptsetup 2.7.5"
+    validations:
+      required: true
+
+  - type: input
+    id: distro_target
+    attributes:
+      label: Which system you ran it AGAINST
+      description: >
+        The installed distro being encrypted, its filesystem, and its initramfs
+        generator if you know it. This and the field above are different code
+        paths through the same script.
+      placeholder: "Debian 13, ext4 root, initramfs-tools"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component
+      options:
+        - bin/linuxlocker.sh (OS detection, dependency install, dispatch)
+        - bin/luks-deploy.sh (the encrypter)
+        - bin/lib-deps.sh (package manager layer)
+        - bin/luks-tune.sh
+        - bin/post-encryption-setup.sh
+        - bin/save-luks-recovery-bundle.sh
+        - extras/luks-fetch-cache
+        - tests/loopback-core-test.sh
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Did it fail before or after the point of no return?
+      description: >
+        `luks-deploy.sh` prints stage numbers, and refuses to encrypt the
+        filesystem it is booted from.
+      options:
+        - Before — detection, menus, fstab checks, KDF benchmark, --dry-run
+        - During the filesystem shrink
+        - During the reencrypt itself
+        - After reencrypt, during boot configuration
+        - At the verification gate
+        - At boot, after a completed deploy
+        - Not applicable
+    validations:
+      required: true
+
+  - type: input
+    id: stage_number
+    attributes:
+      label: Stage number it stopped at
+      description: The script prints these. If it printed a recovery command list on exit, include it below.
+      placeholder: "stage 7"
+
+  - type: input
+    id: version
+    attributes:
+      label: LinuxLocker version
+      description: >
+        `git -C /path/to/LinuxLocker describe --tags --always --dirty`. Only the
+        latest release receives fixes.
+      placeholder: "v1.1.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: The exact command you ran
+      description: Include any `LUKS_*` environment variables you set — but never the contents of `LUKS_PASSPHRASE_FILE`.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+      description: >
+        Paste output verbatim. If the machine would not boot, say what the screen
+        showed and whether you reached an initramfs prompt, a bootloader prompt,
+        or nothing at all.
+    validations:
+      required: true
+
+  - type: textarea
+    id: bundle
+    attributes:
+      label: Diagnostic bundle
+      description: >
+        Run the read-only bundle from CONTRIBUTING.md and attach the file, or
+        paste it here. It collects state and changes nothing.
+      render: text
+
+  - type: textarea
+    id: luksdump
+    attributes:
+      label: "cryptsetup luksDump (optional)"
+      description: >
+        Plain `luksDump` only — it shows cipher, KDF and slot metadata, no key
+        material. **Not `--dump-master-key`.**
+      render: text
+
+  - type: checkboxes
+    id: confirms
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have not pasted `--dump-master-key` output or uploaded a header backup image.
+          required: true
+        - label: I have said which distro I ran it from and which I ran it against.
+          required: true
+        - label: I am on the latest release, or I have said which commit above.
+          required: true
+        - label: If this is a boot failure, I have read `docs/RECOVERY.md` and it is not covered there.
+          required: true
+        - label: This is not a security vulnerability. Those go to the address in SECURITY.md.
+          required: true
