@@ -14,8 +14,16 @@ body:
         > upload a header backup image.** Either one hands over your disk. Plain
         > `cryptsetup luksDump` is safe — cipher, KDF and slot metadata only.
 
-        This project takes serious bugs and new filesystem support, and nothing
-        else — see
+        > ### Attach the diagnostic bundle
+        > ```
+        > sudo ./bin/linuxlocker-diag.sh -o linuxlocker-report.md
+        > ```
+        > Read-only, redacts UUIDs, and excludes everything that would be key
+        > material. It is the single most useful thing you can attach — read it
+        > before posting anyway.
+
+        This project takes serious bugs, test reports and new filesystem
+        support, and nothing else — see
         [`CONTRIBUTING.md`](https://github.com/doug445/LinuxLocker/blob/main/CONTRIBUTING.md).
         If the machine will not boot, read
         [`docs/RECOVERY.md`](https://github.com/doug445/LinuxLocker/blob/main/docs/RECOVERY.md)
@@ -49,12 +57,15 @@ body:
       options:
         - bin/linuxlocker.sh (OS detection, dependency install, dispatch)
         - bin/luks-deploy.sh (the encrypter)
-        - bin/lib-deps.sh (package manager layer)
+        - bin/lib-deps.sh (package manager layer, Asahi guard)
+        - bin/lib-uki.sh (UKI / systemd-boot / Secure Boot)
         - bin/luks-tune.sh
         - bin/post-encryption-setup.sh
         - bin/save-luks-recovery-bundle.sh
         - extras/luks-fetch-cache
+        - bin/linuxlocker-diag.sh (diagnostic bundle)
         - tests/loopback-core-test.sh
+        - tests/uki-fixture-test.sh
         - Documentation
         - Not sure
     validations:
