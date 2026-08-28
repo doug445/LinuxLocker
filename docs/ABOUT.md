@@ -2,9 +2,15 @@
 
 **LinuxLocker is a universal, in-place LUKS2 full-disk-encryption tool for
 Linux systems that are already installed.** It converts an existing root (or
-data) partition into an encrypted LUKS2 container without reinstalling the
-operating system, without a second copy of your data, and without changing the
-filesystem UUID.
+data) partition into an encrypted LUKS2 container — `dm-crypt` under
+`aes-xts-plain64`, argon2id keyslots — without reinstalling the operating
+system, without a second copy of your data, and without changing the filesystem
+UUID. Your **ext4** or **btrfs** root, its subvolumes and its snapshots come
+through the in-place encryption unchanged; the partition simply gains an
+encryption layer.
+
+You run it from a **live USB**, it detects everything about the target itself,
+and it refuses to let you reboot until the result verifies.
 
 This page is the long-form description of what the project is, who it is for,
 and where its boundaries are. For how to run it, start with the
@@ -31,8 +37,12 @@ around it** — and that is what LinuxLocker automates:
   which bootloader the *target* actually uses, from the target's own artefacts;
 - rewriting `crypttab`, `fstab`, GRUB defaults, BLS entries, `cmdline.txt`,
   `extlinux.conf` and the initramfs generator's config to match;
-- rebuilding **every** initramfs image inside a chroot, and self-repairing any
-  that come out without `cryptsetup` or `dm-crypt` in them;
+- rebuilding **every** initramfs image inside a chroot — `dracut`, `mkinitcpio`
+  or `initramfs-tools` — and self-repairing any that come out without
+  `cryptsetup` or `dm-crypt` in them;
+- rebuilding and re-signing the Unified Kernel Image, on the targets that boot
+  one, because a UKI carries the kernel command line inside the signed `.efi`
+  where no amount of editing `/etc/kernel/cmdline` can reach it;
 - refusing to let you reboot until a verification pass over every applicable
   component succeeds.
 
@@ -55,13 +65,18 @@ this project exists as a tool rather than a wiki page.
 - **Anyone with an existing LUKS1 volume** who wants LUKS2 and argon2id
   keyslots, which `luks-tune.sh` and the conversion flow provide without
   touching data.
+- **Anyone running systemd-boot with Unified Kernel Images and Secure Boot** —
+  the modern Arch, Manjaro and Fedora layout, and the one most in-place
+  encryption guides quietly break, because they stop at `crypttab` and the
+  initramfs and never touch the `.efi` that actually boots.
 
 ## What makes it different
 
 **It is keyed off the target, not off a distro name.** Behaviour is decided by
 what is actually installed on the machine being encrypted — is `dracut` there,
-or `mkinitcpio`, or `initramfs-tools`; does `/boot/loader/entries` exist; what
-does the target's own fstab say `/boot` and the ESP are. Derivatives therefore
+or `mkinitcpio`, or `initramfs-tools`; does `/boot/loader/entries` exist; does a
+preset carry a `_uki=` line; what does the target's own fstab say `/boot` and the
+ESP are. Derivatives therefore
 inherit support from their family without needing to be named anywhere. Fedora,
 RHEL, Rocky, AlmaLinux, Debian, Ubuntu, Linux Mint, Pop!\_OS, Raspberry Pi OS,
 Arch, Manjaro, EndeavourOS and openSUSE are all covered by that rule, on x86_64
@@ -99,8 +114,12 @@ would issue — and exits before the point of no return.
   an encrypted `/boot` would have to be unlocked by GRUB, which is far more
   constrained in what KDF cost it can afford. Weakening argon2id to fit the
   bootloader would trade a real defence for a partial one.
-- **It does not enroll a TPM, bind to Secure Boot, or set up network-bound
-  unlock.** You type the passphrase at boot.
+- **It does not enroll a TPM2, seal to PCRs, or set up network-bound unlock.**
+  You type the passphrase at boot. Secure Boot is a different matter and *is*
+  handled: when a target boots a Unified Kernel Image, the rebuilt `.efi` is
+  re-signed with `sbctl` or `sbsign` and the signature verified before the
+  reboot is allowed — because on Arch and Manjaro the usual signing hook is a
+  libalpm hook that never fires when a tool rebuilds the UKI directly.
 - **It does not run from the system it is encrypting.** It hard-refuses without
   a typed override, because rewriting the filesystem you are booted from is not
   a supported operation.
@@ -117,7 +136,10 @@ protection, U-Boot EFI entry cleanup) that have no meaning elsewhere.
 LinuxLocker drops those and generalises everything else: the package-manager
 layer, the filesystem handlers, and the boot-configuration rewriter.
 
-**On Apple Silicon, use AsahiLocker. Everywhere else, use LinuxLocker.**
+**On Apple Silicon, use AsahiLocker. Everywhere else, use LinuxLocker.** You do
+not have to keep that straight yourself — LinuxLocker detects Fedora Asahi Remix
+and Apple Silicon hardware and exits with a link to AsahiLocker before touching
+any device.
 
 ## Safety posture
 
@@ -131,8 +153,11 @@ those exists because the failure it prevents is unrecoverable.
 
 The whole core is exercised by `tests/loopback-core-test.sh` against loop
 devices — including a hard kill mid-re-encryption and a LUKS1 → LUKS2
-conversion — so the recovery paths are tested, not assumed. It touches no real
-disk.
+conversion — so the recovery paths are tested, not assumed. The UKI,
+systemd-boot and Secure Boot decision logic is exercised separately by
+`tests/uki-fixture-test.sh` against synthetic target trees, covering every ESP
+layout, every rebuild backend, every signer, and the refusal matrix. Neither
+touches a real disk; both run in CI on x86_64 and aarch64.
 
 Read [`SECURITY.md`](../SECURITY.md) before filing anything, and especially
 before attaching diagnostics: the artefacts this tool produces can be the keys
@@ -143,8 +168,10 @@ themselves.
 | | |
 |---|---|
 | **License** | MIT |
-| **Language** | Bash (shellcheck-clean) |
+| **Language** | Bash — a pure shell-script project, `shellcheck -S warning` clean, no runtime dependencies a sysadmin would not already have on a rescue USB |
 | **Architectures** | x86_64, aarch64 |
+| **Boot stacks** | GRUB + BLS, systemd-boot, Unified Kernel Images, Secure Boot, Raspberry Pi `cmdline.txt`, U-Boot `extlinux.conf` |
+| **Filesystems** | ext4/ext3/ext2, btrfs, xfs (slack only), f2fs, ntfs, vfat |
 | **Cipher** | `aes-xts-plain64`, 512-bit key (AES-256-XTS) |
 | **KDF** | argon2id, pinned per profile — no pbkdf2 path |
 | **Requires** | `cryptsetup` ≥ 2.4 in the live environment |

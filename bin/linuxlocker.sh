@@ -42,6 +42,8 @@
 #   sudo ./linuxlocker.sh tune               # KDF tuning UI for existing LUKS2
 #   sudo ./linuxlocker.sh post               # post-encryption-setup (on target)
 #   sudo ./linuxlocker.sh bundle             # save a LUKS recovery bundle
+#   sudo ./linuxlocker.sh diag               # read-only diagnostic bundle for
+#                                            # a bug report (changes nothing)
 #   ./linuxlocker.sh --help
 #
 # Environment knobs are documented in the header of bin/luks-deploy.sh and are
@@ -60,16 +62,31 @@ usage() {
 ACTION="deploy"
 case "${1:-}" in
     -h|--help) usage; exit 0 ;;
-    deploy|tune|post|bundle) ACTION="$1"; shift ;;
+    deploy|tune|post|bundle|diag) ACTION="$1"; shift ;;
     --*) : ;;                      # bare flags (e.g. --dry-run) go to deploy
     "") : ;;
-    *) echo "linuxlocker.sh: unknown action '$1' (deploy|tune|post|bundle, or --help)" >&2; exit 2 ;;
+    *) echo "linuxlocker.sh: unknown action '$1' (deploy|tune|post|bundle|diag, or --help)" >&2; exit 2 ;;
 esac
 
 [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo $0 ${ACTION}" >&2; exit 1; }
 
 # shellcheck source=lib-deps.sh
 . "$SCRIPT_DIR/lib-deps.sh"
+
+# The diagnostic bundle runs before every other gate — including the Asahi
+# refusal and the dependency installer. Its job is to describe a machine that
+# is already in the wrong state, so it must never be the thing that refuses.
+if [ "$ACTION" = "diag" ]; then
+    exec "$SCRIPT_DIR/linuxlocker-diag.sh" "$@"
+fi
+
+# ─── Apple Silicon / Fedora Asahi Remix — wrong tool ─────────────────────────
+# Checked at the front door as well as in luks-deploy.sh, so `linuxlocker.sh
+# post` and `bundle` stop here too rather than half-configuring an Asahi box.
+if ll_detect_asahi ""; then
+    ll_asahi_refuse "This machine is Apple Silicon / Fedora Asahi Remix."
+    exit 3
+fi
 
 echo "════════════════════════════════════════════════════════════"
 echo " LinuxLocker — environment detection"

@@ -44,3 +44,18 @@ jobs:
           sudo apt-get install -y -q cryptsetup-bin btrfs-progs
       - name: loopback core test
         run: sudo bash tests/loopback-core-test.sh
+
+  uki-fixtures:
+    # UKI / systemd-boot / Secure Boot detection against synthetic target
+    # trees. No disk, no root, no network — pure logic, so it runs everywhere.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install binutils (objcopy, for .cmdline extraction)
+        run: sudo apt-get update -q && sudo apt-get install -y -q binutils
+      - name: UKI fixture test
+        run: bash tests/uki-fixture-test.sh
