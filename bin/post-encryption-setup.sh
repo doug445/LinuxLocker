@@ -211,9 +211,18 @@ if [ -f "$SPLASH_MARKER" ]; then
             && ok "/etc/kernel/cmdline: appended '$TOKENS'"
     fi
     if [ -f /etc/default/grub ] && ! grep -qw "$FIRST_TOKEN" /etc/default/grub; then
+        # sed exits 0 even when it matched nothing — an unquoted value, or a
+        # file with neither variable, leaves the splash unrestored. Confirm the
+        # tokens actually landed instead of trusting the exit code, and only
+        # regenerate grub.cfg when something really changed.
         sed -i -E "s/^(GRUB_CMDLINE_LINUX_DEFAULT=\".*)\"[[:space:]]*\$/\1 $TOKENS\"/;t
-                   s/^(GRUB_CMDLINE_LINUX=\".*)\"[[:space:]]*\$/\1 $TOKENS\"/" /etc/default/grub \
-            && ok "/etc/default/grub: appended '$TOKENS'" && GRUB_DEFAULT_TOUCHED=1
+                   s/^(GRUB_CMDLINE_LINUX=\".*)\"[[:space:]]*\$/\1 $TOKENS\"/" /etc/default/grub
+        if grep -qw "$FIRST_TOKEN" /etc/default/grub; then
+            ok "/etc/default/grub: appended '$TOKENS'"
+            GRUB_DEFAULT_TOUCHED=1
+        else
+            warn "/etc/default/grub: no quoted GRUB_CMDLINE_LINUX[_DEFAULT] line to append '$TOKENS' to"
+        fi
     fi
     # Raspberry Pi-style cmdline.txt
     for CMDTXT in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
