@@ -114,9 +114,9 @@ backend exists, or Secure Boot is on and no signing backend exists. Both are
 overridable with `LUKS_ALLOW_UKI=1`.
 
 This is verified by 45 fixture assertions in CI across every ESP layout, backend
-and signer combination — but has **not** yet been through a full
-encrypt-and-reboot cycle on hardware. [BOOTLOADERS.md](docs/BOOTLOADERS.md) has
-the full detail, the environment knobs, and the hardware checklist.
+and signer combination — verified end to end on Manjaro w/ systemd-boot/UKI. 
+[BOOTLOADERS.md](docs/BOOTLOADERS.md) has the full detail, the environment 
+knobs, and the hardware checklist.
 
 ### Filesystems
 
@@ -382,7 +382,7 @@ Support is keyed off what is **actually installed on the target**, never off the
 distro's name, so derivatives inherit it from their family: Fedora / RHEL /
 Rocky / AlmaLinux (dnf, dracut, BLS), Debian / Ubuntu / Mint / Pop!\_OS (apt,
 initramfs-tools), Arch / Manjaro / EndeavourOS (pacman, mkinitcpio), openSUSE
-(zypper, dracut), and Raspberry Pi OS. Alpine, Void and Gentoo are recognised by
+(zypper, dracut), and Raspberry Pi OS. Alpine, Void and Gentoo are recognized by
 the dependency installer. See [Supported systems](#supported-systems).
 
 ### Does it work on a Raspberry Pi or another ARM board?
