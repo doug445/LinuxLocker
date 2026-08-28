@@ -11,7 +11,7 @@ LinuxLocker encrypts the root filesystem of an already-installed system in
 place — without reinstalling, and without a second copy of your data. One
 tool, any distro family it can chroot into, x86_64 and ARM alike: Fedora,
 RHEL, Rocky, AlmaLinux, Debian, Ubuntu, Linux Mint, Pop!_OS, Raspberry Pi OS,
-Arch, Manjaro, EndeavourOS and openSUSE.
+Arch, Manjaro, EndeavourOS and openSUSE. Converts LUKS1 to a LUKS2 container. 
 
 > ### ⚠️ Running Fedora Asahi Remix, or any Linux on Apple Silicon (M1/M2/M3/M4)?
 >
