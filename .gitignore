@@ -10,3 +10,6 @@ post-encryption.conf
 
 # Local SEO / launch scratch — not published
 github-about.txt
+
+# Agent scratch specs — the design docs that matter live in docs/design/
+docs/superpowers/
