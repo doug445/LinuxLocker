@@ -137,6 +137,24 @@ if [ -f "$SCRIPT_DIR/lib-deps.sh" ]; then
     ll_detect_pkg_mgr || true
 fi
 
+# ─── UKI / systemd-boot / Secure Boot support ────────────────────────────────
+# Optional in the same way: without lib-uki.sh a UKI target is refused outright
+# (the pre-1.2.0 behaviour), because nothing else here can regenerate the .efi.
+LL_HAVE_UKI_LIB=0
+if [ -f "$SCRIPT_DIR/lib-uki.sh" ]; then
+    # shellcheck source=lib-uki.sh
+    . "$SCRIPT_DIR/lib-uki.sh"
+    LL_HAVE_UKI_LIB=1
+fi
+
+# ─── Apple Silicon / Fedora Asahi Remix — wrong tool, stop here ──────────────
+# Checked before ANY device is touched. AsahiLocker carries the boot guards
+# this script deliberately drops; running here risks an unbootable Mac.
+if [ "$LL_HAVE_DEPS_LIB" -eq 1 ] && ll_detect_asahi ""; then
+    ll_asahi_refuse "This live environment is running on Apple Silicon / Fedora Asahi Remix."
+    exit 3
+fi
+
 # ─── Permissions on the deployment drive ─────────────────────────────────────
 # chmod(2) SUCCEEDS and does nothing on vfat/exfat/ntfs: the mode comes from the
 # mount's fmask/dmask, not from the inode. So `chmod 0400 secret` on a FAT stick
@@ -215,6 +233,26 @@ harden_path() {                        # harden_path <octal-mode> <path>
 #                                the passphrase prompt is visible;
 #                                post-encryption-setup.sh restores them)
 #   LUKS_SKIP_VERSION_CHECK=1    bypass the cryptsetup >= 2.4 floor
+#   LUKS_ALLOW_UKI=1             deploy onto a UKI target even when this script
+#                                cannot rebuild or sign the .efi itself. UKI
+#                                targets with a working rebuild path are
+#                                supported WITHOUT this flag; it exists only to
+#                                override the two remaining refusals (no rebuild
+#                                backend, or Secure Boot on with no signer).
+#                                Regenerating and re-signing EFI/Linux/*.efi
+#                                then becomes your job, before the first reboot.
+#   LUKS_UKI_REGEN=<backend>     force the UKI rebuild backend instead of
+#                                detecting it: mkinitcpio | kernel-install |
+#                                dracut | ukify | none
+#   LUKS_UKI_SIGN=<backend>      force the signing backend: sbctl | sbsign | none
+#   LUKS_SB_KEY=<path>           explicit sbsign key ... and
+#   LUKS_SB_CERT=<path>          ... its certificate. Both, or neither.
+#   LUKS_SKIP_UKI_SIGN=1         rebuild the UKI but do not sign it. On a Secure
+#                                Boot machine this WILL fail to boot until you
+#                                sign it yourself — V12 downgrades to a warning.
+#   LUKS_SB_STATE=enabled|disabled
+#                                override Secure Boot autodetection (testing).
+#                                See docs/BOOTLOADERS.md for all of the above.
 #   LUKS_DRY_RUN=1 (or --dry-run flag)  preview: full detection + plan, no
 #                                       changes to the target, exit before
 #                                       the point of no return
@@ -595,6 +633,11 @@ cleanup() {
     # inside /mnt_temp, and a plain umount would fail on the child mount)
     umount -R /mnt_temp 2>/dev/null || umount /mnt_temp 2>/dev/null || true
     rmdir /mnt_temp 2>/dev/null || true
+    for uki_probe_dir in /tmp/luks-uki-probe.*; do
+        [ -d "$uki_probe_dir" ] || continue
+        umount "$uki_probe_dir" 2>/dev/null || true
+        rmdir "$uki_probe_dir" 2>/dev/null || true
+    done
     # Clean up chroot bind mounts (specific order matters)
     umount /mnt/sys/firmware/efi/efivars 2>/dev/null || true
     for mp in /mnt/run /mnt/sys /mnt/proc /mnt/dev/pts /mnt/dev; do
@@ -1328,6 +1371,14 @@ if [ "$SYSTEM_MODE" -eq 1 ]; then
         esac
     fi
     log "  Target OS: $TARGET_OS_PRETTY (id=${TARGET_OS_ID:-?} family=$TARGET_FAMILY)"
+
+    # The TARGET may be Fedora Asahi Remix even when the live environment is
+    # not (an Asahi disk read from another machine, a rescue image that does
+    # not identify itself). ID=fedora, so only the variant fields catch it.
+    if [ "$LL_HAVE_DEPS_LIB" -eq 1 ] && ll_detect_asahi "/mnt_temp/${SUBPATH%/}"; then
+        ll_asahi_refuse "The partition you selected holds a Fedora Asahi Remix install."
+        exit 3
+    fi
 fi
 
 # Capture the filesystem UUID before encryption. In config-only mode the raw
@@ -1479,6 +1530,106 @@ if [ "$SYSTEM_MODE" -eq 1 ]; then
     fi
     if [ "$BOOT_IS_SEPARATE" -eq 1 ] && [ "$BLS_SRC" = "/mnt_temp/${SUBPATH}boot" ]; then
         umount "/mnt_temp/${SUBPATH}boot" 2>/dev/null || true
+    fi
+fi
+
+# ─── Unified Kernel Image detection + conditional guard ──────────────────────
+# A UKI carries the kernel, the initramfs AND the kernel command line inside one
+# PE binary (EFI/Linux/*.efi). Writing /etc/kernel/cmdline and rebuilding
+# /boot/initramfs-*.img changes nothing about what the firmware loads: the .efi
+# has to be REBUILT, and on a Secure Boot machine re-signed, because the .efi is
+# the object the firmware verifies.
+#
+# Up to 1.1.0 this block refused every UKI target unconditionally. It is now
+# conditional: step 7f rebuilds the .efi and step 7g signs it, so a UKI target
+# with a working regeneration path is supported. The refusal survives for the
+# two cases where proceeding would still hand back a green report and a dead
+# machine — no way to rebuild the .efi, or no way to sign it with Secure Boot on.
+#
+# --- The pre-1.2.0 unconditional refusal, kept for reference ----------------
+# if [ "${#UKI_FOUND[@]}" -gt 0 ]; then
+#     warn "  Unified Kernel Images found on this target:"
+#     for uki in "${UKI_FOUND[@]}"; do warn "    $uki"; done
+#     warn "  ... nothing here regenerates the .efi ..."
+#     if [ "${LUKS_ALLOW_UKI:-0}" = "1" ]; then
+#         warn "  LUKS_ALLOW_UKI=1 is set — continuing anyway."
+#     else
+#         fatal "Refusing to deploy onto a UKI target (set LUKS_ALLOW_UKI=1 to override)."
+#     fi
+# fi
+# ---------------------------------------------------------------------------
+#
+# Everything below runs BEFORE the shrink and BEFORE encryption, while aborting
+# still costs nothing. See docs/BOOTLOADERS.md.
+UKI_FOUND=()
+UKI_ACTIVE=0            # 1 = this run must regenerate (and maybe sign) a UKI
+if [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "$SYSTEM_MODE" -eq 1 ]; then
+    uki_probe_dev "$TARGET_EFI"  "ESP"      # the usual home of EFI/Linux
+    uki_probe_dev "$TARGET_BOOT" "/boot"    # XBOOTLDR layouts keep them here
+    # /boot on the root filesystem: /mnt_temp is already mounted read-only.
+    if [ "$BOOT_IS_SEPARATE" -eq 0 ]; then
+        uki_scan_dir "/mnt_temp/${SUBPATH%/}" "/boot"
+    fi
+    uki_detect_regen  "/mnt_temp/${SUBPATH%/}" || true
+    uki_detect_signer "/mnt_temp/${SUBPATH%/}" || true
+    uki_detect_sdboot "/mnt_temp/${SUBPATH%/}" || true
+    uki_detect_sb
+elif [ "$SYSTEM_MODE" -eq 1 ]; then
+    # No lib-uki.sh next to this script: fall back to bare detection so the
+    # refusal below still fires. Never proceed onto a UKI we cannot rebuild.
+    for uki in "/mnt_temp/${SUBPATH:-}boot"/EFI/Linux/*.efi \
+               "/mnt_temp/${SUBPATH:-}boot/efi"/EFI/Linux/*.efi \
+               "/mnt_temp/${SUBPATH:-}efi"/EFI/Linux/*.efi; do
+        [ -f "$uki" ] || continue
+        UKI_FOUND+=("/boot:$(basename "$uki")")
+    done
+fi
+
+if [ "${#UKI_FOUND[@]}" -gt 0 ]; then
+    echo ""
+    log "════════════════════════════════════════════════════════════"
+    log "  Unified Kernel Images found on this target:"
+    for uki in "${UKI_FOUND[@]}"; do log "    $uki"; done
+    log "    rebuild backend : ${UKI_REGEN:-none}${UKI_REGEN_DETAIL:+  ($UKI_REGEN_DETAIL)}"
+    log "    signing backend : ${UKI_SIGN:-none}${UKI_SIGN_DETAIL:+  ($UKI_SIGN_DETAIL)}"
+    log "    Secure Boot     : ${UKI_SB_STATE:-unknown}"
+    [ "${UKI_SDBOOT:-0}" -eq 1 ] && log "    systemd-boot    : $UKI_SDBOOT_DETAIL"
+    log "════════════════════════════════════════════════════════════"
+
+    UKI_REFUSE=""
+    if [ "$LL_HAVE_UKI_LIB" -eq 0 ]; then
+        UKI_REFUSE="lib-uki.sh is not next to this script, so nothing here can regenerate the .efi"
+    elif [ "${UKI_REGEN:-none}" = "none" ]; then
+        UKI_REFUSE="no UKI regeneration backend found (mkinitcpio preset with _uki=, kernel-install with layout=uki, dracut --uki-file, or ukify)"
+    elif [ "${UKI_SB_STATE:-unknown}" = "enabled" ] && [ "${UKI_SIGN:-none}" = "none" ] \
+         && [ "${LUKS_SKIP_UKI_SIGN:-0}" != "1" ]; then
+        UKI_REFUSE="Secure Boot is enabled but no signing backend was found${UKI_SIGN_DETAIL:+ — $UKI_SIGN_DETAIL}"
+    fi
+
+    if [ -n "$UKI_REFUSE" ]; then
+        echo ""
+        warn "  Cannot safely deploy onto this UKI target:"
+        warn "    $UKI_REFUSE"
+        warn ""
+        warn "  Proceeding would encrypt the disk, rebuild the standalone"
+        warn "  initramfs correctly, write /etc/kernel/cmdline correctly — and"
+        warn "  leave the firmware booting an .efi that still carries the"
+        warn "  pre-encryption command line, or one it refuses to load at all."
+        warn "  Every check in step 8 would report OK, because the files those"
+        warn "  checks read really are correct. See docs/BOOTLOADERS.md."
+        if [ "${LUKS_ALLOW_UKI:-0}" = "1" ]; then
+            warn ""
+            warn "  LUKS_ALLOW_UKI=1 is set — continuing anyway. Regenerating and"
+            warn "  re-signing EFI/Linux/*.efi before the first reboot is YOUR"
+            warn "  responsibility now."
+            UKI_ACTIVE=1
+        else
+            fatal "Refusing to deploy onto this UKI target (set LUKS_ALLOW_UKI=1 to override)."
+        fi
+    else
+        UKI_ACTIVE=1
+        log "  UKI support active: step 7f rebuilds the .efi, step 7g signs it,"
+        log "  and checks V11/V12 verify both before the reboot is allowed."
     fi
 fi
 
@@ -1697,7 +1848,17 @@ if [ "$DRY_RUN" = "1" ]; then
         fi
         echo "  7. in chroot: rebuild ALL initramfs images (dracut/mkinitcpio/initramfs-tools),"
         echo "     update BLS entries / GRUB config (never the ESP stub), restorecon if SELinux"
+        if [ "$UKI_ACTIVE" -eq 1 ]; then
+            echo "  7f. rebuild ${#UKI_FOUND[@]} Unified Kernel Image(s) with ${UKI_REGEN}"
+            echo "      (AFTER the splash strip, so the final cmdline is what gets baked in)"
+            if [ "${UKI_SIGN:-none}" != "none" ]; then
+                echo "  7g. sign the rebuilt .efi with ${UKI_SIGN}${UKI_SB_KEY:+ ($UKI_SB_KEY)}"
+            else
+                echo "  7g. (no signing backend; Secure Boot is ${UKI_SB_STATE})"
+            fi
+        fi
         echo "  8. run the verification gate; refuse the reboot message on any error"
+        [ "$UKI_ACTIVE" -eq 1 ] && echo "      including V11 (.cmdline of every UKI) and V12 (its signature)"
     else
         echo "  4. grow the filesystem to fill the container"
         echo "  5. offer a recovery keyslot; back up the LUKS header to $STATE_DIR/"
@@ -1946,6 +2107,16 @@ fi
 # ─── Target boot machinery detection (initramfs generator + bootloader) ──────
 # Detected from what is INSTALLED ON THE TARGET, never from the live
 # environment or the distro's name.
+#
+# systemd-boot is now detected properly (uki_detect_sdboot looks for the loader
+# binary on the ESP) rather than inferred from /boot/loader/entries, which GRUB's
+# own BLS support uses too. HAS_BLS still keys off that directory, because
+# patching Type #1 entries is correct for both.
+#
+# UKIs are re-detected here against /mnt, where every target filesystem is
+# mounted — the discovery pass ran against read-only probe mounts and could
+# only see partitions it was handed. This pass is the authoritative one, and it
+# is what steps 7f/7g and checks V11-V13 act on. See docs/BOOTLOADERS.md.
 INITRAMFS_STYLE="none"
 MKINITCPIO_SD=0
 GRUB_UPDATE_TOOL=""
@@ -1982,15 +2153,33 @@ if [ "$SYSTEM_MODE" -eq 1 ]; then
         [ -f "$f" ] && EXTLINUX_CONF="$f" && break
     done
 
+    # Authoritative UKI / systemd-boot pass, with everything mounted under /mnt.
+    if [ "$LL_HAVE_UKI_LIB" -eq 1 ]; then
+        uki_find_ukis     /mnt
+        uki_detect_regen  /mnt || true
+        uki_detect_signer /mnt || true
+        uki_detect_sdboot /mnt || true
+        [ "${#UKI_PATHS[@]}" -gt 0 ] && UKI_ACTIVE=1
+    fi
+
     log "    initramfs : $INITRAMFS_STYLE$( [ "$MKINITCPIO_SD" -eq 1 ] && echo ' (systemd hooks)' )"
     log "    grub tool : ${GRUB_UPDATE_TOOL:-none}   grubby: $HAS_GRUBBY   BLS entries: $HAS_BLS"
     [ -n "$RPI_CMDLINE" ]  && log "    cmdline.txt : ${RPI_CMDLINE#/mnt} (Raspberry Pi-style boot)"
     [ -n "$EXTLINUX_CONF" ] && log "    extlinux    : ${EXTLINUX_CONF#/mnt}"
+    [ "${UKI_SDBOOT:-0}" -eq 1 ] && log "    sd-boot   : ${UKI_SDBOOT_DETAIL}"
+    if [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "${#UKI_PATHS[@]}" -gt 0 ]; then
+        log "    UKI       : ${#UKI_PATHS[@]} image(s), rebuild=${UKI_REGEN} sign=${UKI_SIGN} secureboot=${UKI_SB_STATE}"
+    fi
 
-    if [ "$GRUB_UPDATE_TOOL" = "" ] && [ "$HAS_BLS" -eq 0 ] && [ -z "$RPI_CMDLINE" ] && [ -z "$EXTLINUX_CONF" ]; then
-        warn "  No recognised bootloader config (GRUB / BLS / cmdline.txt / extlinux)."
+    if [ "$GRUB_UPDATE_TOOL" = "" ] && [ "$HAS_BLS" -eq 0 ] && [ -z "$RPI_CMDLINE" ] \
+       && [ -z "$EXTLINUX_CONF" ] && [ "$UKI_ACTIVE" -eq 0 ]; then
+        # No GRUB, no BLS entries, no cmdline.txt, no extlinux — and no UKI to
+        # rebuild either. Nothing here knows how this machine gets its kernel
+        # arguments, so say so rather than reporting a silent success.
+        warn "  No recognised bootloader config (GRUB / BLS / UKI / cmdline.txt / extlinux)."
         warn "  crypttab, fstab and the initramfs will still be configured, but you"
         warn "  must add the kernel arguments to your bootloader yourself."
+        warn "  systemd-boot / UKI targets: see docs/BOOTLOADERS.md."
     fi
 fi
 
@@ -2030,6 +2219,15 @@ log "[5/8] Recovery key + LUKS header backup..."
 # Non-interactive: LUKS_RECOVERY_KEY=yes|no
 SLOTS_IN_USE=$(cryptsetup luksDump "$TARGET_ROOT" 2>/dev/null | grep -cE '^[[:space:]]+[0-9]+: luks2' || true)
 RK_CHOICE="${LUKS_RECOVERY_KEY:-}"
+
+# Default the prompt to NO on a configuration-only re-run. Each acceptance
+# enrols another keyslot, so someone who re-runs the config phase a few times
+# and keeps hitting Enter ends up with a header full of recovery keys they
+# cannot tell apart. A fresh encrypt still defaults to yes: that is the run
+# where there is no recovery key yet, and no way back if the passphrase is lost.
+RK_DEFAULT="yes"
+[ "$DEPLOY_MODE" = "config-only" ] && RK_DEFAULT="no"
+
 if [ -z "$RK_CHOICE" ]; then
     echo ""
     echo "  A recovery key is a random 64-hex-character key in a second LUKS"
@@ -2039,10 +2237,18 @@ if [ -z "$RK_CHOICE" ]; then
     if [ "${SLOTS_IN_USE:-0}" -gt 1 ]; then
         warn "  Note: $SLOTS_IN_USE keyslots are already in use — a recovery key may already be enrolled."
     fi
-    read -p "  Generate and enroll a recovery key now? [Y/n]: " RK_CHOICE
+    if [ "$RK_DEFAULT" = "no" ]; then
+        warn "  This is a configuration-only re-run: saying yes adds ANOTHER"
+        warn "  keyslot on top of what is already there. Defaulting to no."
+        read -p "  Generate and enroll a recovery key now? [y/N]: " RK_CHOICE
+    else
+        read -p "  Generate and enroll a recovery key now? [Y/n]: " RK_CHOICE
+    fi
+    # A bare Enter takes the default rather than falling through to "enrol".
+    RK_CHOICE="${RK_CHOICE:-$RK_DEFAULT}"
 fi
 case "$RK_CHOICE" in
-    n|N|no|NO)
+    [Nn]|[Nn][Oo])
         warn "  Skipping recovery key (passphrase will be the only way in)."
         ;;
     *)
@@ -2216,6 +2422,21 @@ echo "  --- /etc/fstab ---"
 cat /mnt/etc/fstab
 
 # ─── 6c: /etc/default/grub ───────────────────────────────────────────────────
+# Rewrite every definition of $1 in /mnt/etc/default/grub to the literal value
+# $2. The rewrite goes through awk/ENVIRON rather than sed so that an & or a |
+# in the existing command line cannot corrupt the replacement text.
+grub_cmdline_set() {
+    local _gv="$1" _nv="$2" _tmp="/mnt/etc/default/.grub.$$"
+    GV="$_gv" NV="$_nv" awk '
+        BEGIN { v = ENVIRON["GV"]; nv = ENVIRON["NV"] }
+        $0 ~ "^[[:space:]]*" v "=" { print v "=\"" nv "\""; next }
+        { print }
+    ' /mnt/etc/default/grub > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    # cat, not mv: keeps the inode, mode, owner and SELinux label intact.
+    cat "$_tmp" > /mnt/etc/default/grub
+    rm -f "$_tmp"
+}
+
 if [ -f /mnt/etc/default/grub ]; then
     log "  Updating /etc/default/grub..."
     cp /mnt/etc/default/grub /mnt/etc/default/grub.pre-luks
@@ -2226,16 +2447,47 @@ if [ -f /mnt/etc/default/grub ]; then
         log "    Added GRUB_ENABLE_CRYPTODISK=y"
     fi
 
+    # WHICH variable carries the kernel command line is distro-dependent, so
+    # never assume GRUB_CMDLINE_LINUX is present:
+    #   * Fedora / RHEL        ship GRUB_CMDLINE_LINUX
+    #   * Debian / Arch        ship both (GRUB_CMDLINE_LINUX often empty)
+    #   * Fedora Asahi Remix   ships GRUB_CMDLINE_LINUX_DEFAULT and NO
+    #                          GRUB_CMDLINE_LINUX line at all
+    # We write GRUB_CMDLINE_LINUX specifically: grub-mkconfig applies it to
+    # every generated entry including the recovery ones, whereas _DEFAULT is
+    # deliberately left off those — and an unlock argument the recovery entry
+    # lacks is an unbootable rescue path. If the file defines neither, add it.
+    #
+    # This used to read the value with a bare `grep "^GRUB_CMDLINE_LINUX="`
+    # inside a command substitution. Under `set -o pipefail` a file without
+    # that line made grep return 1, which aborted stage 6 with no message at
+    # all — the run just stopped and hit the EXIT trap.
     if [ -n "$LUKS_BOOT_ARGS" ]; then
-        CURRENT_CMDLINE=$(grep "^GRUB_CMDLINE_LINUX=" /mnt/etc/default/grub | sed 's/^GRUB_CMDLINE_LINUX="//' | sed 's/"$//')
-        if ! echo "$CURRENT_CMDLINE" | grep -qF "$LUKS_BOOT_ARGS"; then
-            if grep -q "^GRUB_CMDLINE_LINUX=" /mnt/etc/default/grub; then
-                NEW_CMDLINE="$LUKS_BOOT_ARGS $CURRENT_CMDLINE"
-                sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"$NEW_CMDLINE\"|" /mnt/etc/default/grub
-            else
-                echo "GRUB_CMDLINE_LINUX=\"$LUKS_BOOT_ARGS\"" >> /mnt/etc/default/grub
-            fi
+        if grep -E "^[[:space:]]*GRUB_CMDLINE_LINUX=" /mnt/etc/default/grub \
+             | grep -qF "$LUKS_BOOT_ARGS"; then
+            log "    GRUB_CMDLINE_LINUX already carries the LUKS arguments — keeping."
+        elif grep -qE "^[[:space:]]*GRUB_CMDLINE_LINUX=" /mnt/etc/default/grub; then
+            # Last definition wins when the shell sources this file, so that is
+            # the one whose value we preserve.
+            CURRENT_CMDLINE=$(sed -n -E "s|^[[:space:]]*GRUB_CMDLINE_LINUX=(.*)\$|\1|p" \
+                /mnt/etc/default/grub | tail -n1)
+            case "$CURRENT_CMDLINE" in
+                \"*\") CURRENT_CMDLINE=${CURRENT_CMDLINE#\"}; CURRENT_CMDLINE=${CURRENT_CMDLINE%\"} ;;
+                \'*\') CURRENT_CMDLINE=${CURRENT_CMDLINE#\'}; CURRENT_CMDLINE=${CURRENT_CMDLINE%\'} ;;
+            esac
+            grub_cmdline_set GRUB_CMDLINE_LINUX \
+                "$LUKS_BOOT_ARGS${CURRENT_CMDLINE:+ $CURRENT_CMDLINE}" \
+                || fatal "  Could not rewrite GRUB_CMDLINE_LINUX in /etc/default/grub."
             log "    Added $LUKS_BOOT_ARGS to GRUB_CMDLINE_LINUX"
+        else
+            warn "  No GRUB_CMDLINE_LINUX line in /etc/default/grub — adding one."
+            echo "GRUB_CMDLINE_LINUX=\"$LUKS_BOOT_ARGS\"" >> /mnt/etc/default/grub
+            log "    Added $LUKS_BOOT_ARGS to GRUB_CMDLINE_LINUX"
+        fi
+
+        # Do not leave this stage without the unlock arguments actually on disk.
+        if ! grep -qF "$LUKS_BOOT_ARGS" /mnt/etc/default/grub; then
+            fatal "  /etc/default/grub still has no '$LUKS_BOOT_ARGS' after update!"
         fi
     else
         log "    ($INITRAMFS_STYLE needs no kernel LUKS arguments — crypttab drives the unlock)"
@@ -2387,7 +2639,22 @@ INITRAMFS_STYLE="$INITRAMFS_STYLE"
 GRUB_UPDATE_TOOL="$GRUB_UPDATE_TOOL"
 RPI_CMDLINE="${RPI_CMDLINE#/mnt}"
 EXTLINUX_CONF="${EXTLINUX_CONF#/mnt}"
+UKI_ACTIVE="$UKI_ACTIVE"
+LL_HAVE_UKI_LIB="$LL_HAVE_UKI_LIB"
+LUKS_UKI_REGEN="${UKI_REGEN:-none}"
+LUKS_UKI_SIGN="${UKI_SIGN:-none}"
+LUKS_SB_KEY="${UKI_SB_KEY:-}"
+LUKS_SB_CERT="${UKI_SB_CERT:-}"
+LUKS_SB_STATE="${UKI_SB_STATE:-unknown}"
+LUKS_SKIP_UKI_SIGN="${LUKS_SKIP_UKI_SIGN:-0}"
 EOF
+
+# lib-uki.sh has to run INSIDE the chroot for 7f/7g: the regeneration tools are
+# the target's, not the live environment's, and they must see the target's own
+# /etc/kernel/cmdline, presets and keys.
+if [ "$LL_HAVE_UKI_LIB" -eq 1 ]; then
+    cp "$SCRIPT_DIR/lib-uki.sh" /mnt/tmp/.luks-lib-uki.sh 2>/dev/null || true
+fi
 
 CHROOT_RC=0
 chroot /mnt /bin/bash <<'CHROOT_SCRIPT' || CHROOT_RC=$?
@@ -2531,8 +2798,33 @@ for initrd in /boot/initramfs-*.img /boot/initrd.img-*; do
 done
 
 if [ "$INITRD_FOUND" -eq 0 ]; then
-    echo "[CHROOT] FAIL: No non-rescue initramfs images found!"
-    ERRORS=$((ERRORS + 1))
+    # A UKI-only target legitimately has NO standalone initramfs: an mkinitcpio
+    # preset carrying default_uki= but no default_image= writes only the .efi.
+    # The initramfs still exists — inside the PE binary's .initrd section — so
+    # look there before calling this a failure.
+    UKI_INITRD_OK=0
+    if [ "${UKI_ACTIVE:-0}" = "1" ] && [ -f /tmp/.luks-lib-uki.sh ]; then
+        # shellcheck source=/dev/null
+        . /tmp/.luks-lib-uki.sh
+        uki_find_ukis ""
+        for u in "${UKI_PATHS[@]+"${UKI_PATHS[@]}"}"; do
+            uki_initrd_has "$u" 'cryptsetup'; irc=$?
+            case "$irc" in
+                0) echo "[CHROOT]   OK: $(basename "$u") embeds an initramfs containing cryptsetup"
+                   UKI_INITRD_OK=1 ;;
+                1) echo "[CHROOT]   FAIL: $(basename "$u") embeds an initramfs with NO cryptsetup!"
+                   ERRORS=$((ERRORS + 1)); UKI_INITRD_OK=1 ;;
+                *) echo "[CHROOT]   SKIP: cannot inspect $(basename "$u") (.initrd needs objcopy + lsinitcpio/lsinitrd)"
+                   UKI_INITRD_OK=1 ;;
+            esac
+        done
+    fi
+    if [ "$UKI_INITRD_OK" -eq 0 ]; then
+        echo "[CHROOT] FAIL: No non-rescue initramfs images found!"
+        ERRORS=$((ERRORS + 1))
+    else
+        echo "[CHROOT] No standalone initramfs — this target is UKI-only (expected)."
+    fi
 else
     echo "[CHROOT] Found $INITRD_FOUND non-rescue initramfs image(s)."
 fi
@@ -2752,6 +3044,108 @@ else
     echo "[CHROOT] No GRUB on this target — skipping GRUB config rebuild."
 fi
 
+# ── 7f: Regenerate every Unified Kernel Image ──────────────────────────────
+# Deliberately AFTER 7c½. The UKI bakes /etc/kernel/cmdline in, so rebuilding
+# before the splash strip would bake in the pre-strip line and hide the
+# passphrase prompt behind boot graphics — on a machine where the user also
+# cannot see that it is asking for one.
+#
+# On mkinitcpio targets step 7a already ran `mkinitcpio -P`, which DOES write
+# the .efi when the preset carries default_uki=. That .efi is wrong: it was
+# built before the cmdline was final. This second run is what makes it right.
+echo ""
+if [ "${UKI_ACTIVE:-0}" = "1" ] && [ -f /tmp/.luks-lib-uki.sh ]; then
+    # shellcheck source=/dev/null
+    . /tmp/.luks-lib-uki.sh
+    uki_find_ukis ""
+    echo "[CHROOT] Regenerating ${#UKI_PATHS[@]} Unified Kernel Image(s) via ${LUKS_UKI_REGEN}..."
+
+    # Record mtimes so an untouched .efi is an error, not a silent pass.
+    UKI_MTIME_BEFORE=""
+    for u in "${UKI_PATHS[@]+"${UKI_PATHS[@]}"}"; do
+        UKI_MTIME_BEFORE="$UKI_MTIME_BEFORE $(stat -c '%n=%Y' "$u" 2>/dev/null)"
+    done
+
+    uki_detect_regen  "" || true
+    if uki_regenerate ""; then
+        echo "[CHROOT] UKI regeneration finished."
+    else
+        echo "[CHROOT] FAIL: UKI regeneration reported an error."
+        ERRORS=$((ERRORS + 1))
+    fi
+
+    # Re-scan: kernel-install and dracut can legitimately create new filenames.
+    uki_find_ukis ""
+    UKI_STALE=0
+    for u in "${UKI_PATHS[@]+"${UKI_PATHS[@]}"}"; do
+        now=$(stat -c '%Y' "$u" 2>/dev/null || echo 0)
+        was=$(echo "$UKI_MTIME_BEFORE" | tr ' ' '\n' | sed -n "s|^$u=||p")
+        if [ -n "$was" ] && [ "$now" = "$was" ]; then
+            echo "[CHROOT]   FAIL: $(basename "$u") was NOT rebuilt (mtime unchanged)"
+            UKI_STALE=$((UKI_STALE + 1))
+        else
+            echo "[CHROOT]   OK: $(basename "$u") rebuilt"
+        fi
+    done
+    ERRORS=$((ERRORS + UKI_STALE))
+
+    # Confirm the new command line really is in there, here rather than only at
+    # step 8 — a failure now is still cheap to diagnose with the tools loaded.
+    if [ -n "$LUKS_BOOT_ARGS" ]; then
+        for u in "${UKI_PATHS[@]+"${UKI_PATHS[@]}"}"; do
+            cl=$(uki_cmdline_of "$u" 2>/dev/null || true)
+            if [ -z "$cl" ]; then
+                echo "[CHROOT]   (cannot read .cmdline of $(basename "$u") — no objcopy in the chroot)"
+            elif echo "$cl" | grep -qF "$LUKS_BOOT_ARGS"; then
+                echo "[CHROOT]   OK: $(basename "$u") .cmdline carries the LUKS arguments"
+            else
+                echo "[CHROOT]   FAIL: $(basename "$u") .cmdline lacks '$LUKS_BOOT_ARGS'"
+                ERRORS=$((ERRORS + 1))
+            fi
+        done
+    fi
+
+    # ── 7g: Sign the regenerated images ────────────────────────────────────
+    # Distro signing automation does NOT fire here. Arch's zz-sbctl.hook is a
+    # libalpm hook, so it runs on pacman transactions and not on a bare
+    # `mkinitcpio -P`; sbctl's kernel-install dropin only runs under
+    # kernel-install. A UKI rebuilt above is unsigned until this signs it, and
+    # with Secure Boot on, an unsigned .efi is a firmware-level refusal to boot.
+    echo ""
+    if [ "${LUKS_SKIP_UKI_SIGN:-0}" = "1" ]; then
+        echo "[CHROOT] LUKS_SKIP_UKI_SIGN=1 — not signing. Sign before rebooting."
+    elif [ "$LUKS_UKI_SIGN" = "none" ]; then
+        if [ "$LUKS_SB_STATE" = "enabled" ]; then
+            echo "[CHROOT] CRITICAL: Secure Boot is enabled and no signing backend exists."
+            echo "[CHROOT]           The rebuilt UKI will be REFUSED by the firmware."
+            ERRORS=$((ERRORS + 1))
+        else
+            echo "[CHROOT] No signing backend, and Secure Boot is $LUKS_SB_STATE — skipping (correct here)."
+        fi
+    else
+        echo "[CHROOT] Signing UKI(s) with $LUKS_UKI_SIGN..."
+        uki_detect_signer "" || true
+        if uki_sign ""; then
+            echo "[CHROOT] Signing finished."
+        else
+            echo "[CHROOT] FAIL: signing reported an error."
+            ERRORS=$((ERRORS + 1))
+        fi
+        for u in "${UKI_PATHS[@]+"${UKI_PATHS[@]}"}"; do
+            uki_verify_signed "$u"; vrc=$?
+            case "$vrc" in
+                0) echo "[CHROOT]   OK: $(basename "$u") carries a signature" ;;
+                1) echo "[CHROOT]   FAIL: $(basename "$u") is UNSIGNED after signing!"
+                   [ "$LUKS_SB_STATE" = "enabled" ] && ERRORS=$((ERRORS + 1)) ;;
+                *) echo "[CHROOT]   (cannot verify $(basename "$u") — no sbverify/sbctl in the chroot)" ;;
+            esac
+        done
+    fi
+    rm -f /tmp/.luks-lib-uki.sh
+else
+    echo "[CHROOT] No Unified Kernel Images on this target — skipping UKI rebuild/signing."
+fi
+
 # ── 7e: SELinux — relabel every file this deployment wrote ─────────────────
 # Files created from the live environment get labeled by the LIVE system's
 # policy (or not labeled at all, if its SELinux is off). A mislabeled
@@ -2950,8 +3344,15 @@ if [ -n "$EXTLINUX_CONF" ]; then
         ERRORS=$((ERRORS + 1))
     fi
 fi
+# A UKI is a bootloader configuration in its own right — the command line is
+# inside it. V11 checks the contents; here it just has to count as "found", or
+# an ESP-at-/efi systemd-boot box fails V6 while being perfectly configured.
+if [ "$UKI_ACTIVE" -eq 1 ] && [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "${#UKI_PATHS[@]}" -gt 0 ]; then
+    log "  V6 OK: ${#UKI_PATHS[@]} Unified Kernel Image(s) carry this target's boot configuration"
+    BOOTCFG_OK=1
+fi
 if [ "$BOOTCFG_OK" -eq 0 ] && [ -z "$RPI_CMDLINE" ] && [ -z "$EXTLINUX_CONF" ]; then
-    err "  V6 FAIL: no bootloader configuration found (grub.cfg / cmdline.txt / extlinux.conf)!"
+    err "  V6 FAIL: no bootloader configuration found (grub.cfg / UKI / cmdline.txt / extlinux.conf)!"
     ERRORS=$((ERRORS + 1))
 fi
 
@@ -2965,6 +3366,9 @@ for f in /mnt/boot/initramfs-*.img /mnt/boot/initrd.img-*; do
 done
 if [ "$INITRD_COUNT" -gt 0 ]; then
     log "  V7 OK: $INITRD_COUNT non-rescue initramfs image(s) found"
+elif [ "$UKI_ACTIVE" -eq 1 ] && [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "${#UKI_PATHS[@]}" -gt 0 ]; then
+    # UKI-only target: the initramfs lives in the .initrd section, not on disk.
+    log "  V7 SKIP: no standalone initramfs — this target is UKI-only (V11 covers it)"
 else
     err "  V7 FAIL: No initramfs images!"
     ERRORS=$((ERRORS + 1))
@@ -3020,6 +3424,100 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 
+# ─── V11: UKI command line ───────────────────────────────────────────────────
+# THE check whose absence made the original UKI failure silent. Every other
+# check reads a file that a UKI target has correct; only this one reads the
+# object the firmware actually loads.
+if [ "$LL_HAVE_UKI_LIB" -eq 1 ]; then uki_find_ukis /mnt; fi
+if [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "${#UKI_PATHS[@]}" -gt 0 ]; then
+    CHECKS=$((CHECKS + 1))
+    UKI_OK=0; UKI_TOTAL=0; UKI_UNREADABLE=0
+    for uki in "${UKI_PATHS[@]}"; do
+        UKI_TOTAL=$((UKI_TOTAL + 1))
+        UKI_CL=$(uki_cmdline_of "$uki" 2>/dev/null || true)
+        if [ -z "$UKI_CL" ]; then
+            warn "  V11 SKIP: cannot read the .cmdline section of ${uki#/mnt} (install binutils for objcopy)"
+            UKI_UNREADABLE=$((UKI_UNREADABLE + 1))
+            continue
+        fi
+        if [ -n "$LUKS_BOOT_ARGS" ] && ! echo "$UKI_CL" | grep -qF "$LUKS_BOOT_ARGS"; then
+            err "  V11 FAIL: ${uki#/mnt} .cmdline lacks the LUKS arguments!"
+            err "            wanted: $LUKS_BOOT_ARGS"
+            ERRORS=$((ERRORS + 1))
+            continue
+        fi
+        if echo "$UKI_CL" | grep -qF "root=UUID=$ORIG_FS_UUID"; then
+            err "  V11 FAIL: ${uki#/mnt} .cmdline still points root= at the pre-encryption UUID!"
+            ERRORS=$((ERRORS + 1))
+            continue
+        fi
+        UKI_OK=$((UKI_OK + 1))
+    done
+    if [ "$UKI_UNREADABLE" -eq "$UKI_TOTAL" ]; then
+        warn "  V11 SKIP: none of the $UKI_TOTAL UKI(s) could be inspected"
+    else
+        log "  V11 OK: $UKI_OK/$UKI_TOTAL UKI(s) carry the encrypted root's boot arguments"
+    fi
+
+    # ─── V12: UKI signatures ─────────────────────────────────────────────────
+    CHECKS=$((CHECKS + 1))
+    if [ "${UKI_SB_STATE:-unknown}" != "enabled" ]; then
+        log "  V12 SKIP: Secure Boot is ${UKI_SB_STATE:-unknown} — signatures are not required to boot"
+    elif [ "${LUKS_SKIP_UKI_SIGN:-0}" = "1" ]; then
+        warn "  V12 SKIP: LUKS_SKIP_UKI_SIGN=1 — sign EFI/Linux/*.efi yourself BEFORE rebooting"
+    else
+        SIG_OK=0; SIG_TOTAL=0; SIG_UNKNOWN=0
+        for uki in "${UKI_PATHS[@]}"; do
+            SIG_TOTAL=$((SIG_TOTAL + 1))
+            uki_verify_signed "$uki"; SIG_RC=$?
+            case "$SIG_RC" in
+                0) SIG_OK=$((SIG_OK + 1)) ;;
+                1) err "  V12 FAIL: ${uki#/mnt} is UNSIGNED and Secure Boot is enabled — the firmware will refuse it!"
+                   ERRORS=$((ERRORS + 1)) ;;
+                *) SIG_UNKNOWN=$((SIG_UNKNOWN + 1)) ;;
+            esac
+        done
+        if [ "$SIG_UNKNOWN" -eq "$SIG_TOTAL" ]; then
+            warn "  V12 SKIP: no sbverify/sbctl in the live environment — signatures unverified"
+        else
+            log "  V12 OK: $SIG_OK/$SIG_TOTAL UKI(s) signed"
+        fi
+    fi
+else
+    log "  V11 SKIP: no Unified Kernel Images on this target"
+    log "  V12 SKIP: no Unified Kernel Images to verify signatures on"
+fi
+
+# ─── V13: systemd-boot ───────────────────────────────────────────────────────
+# Confirms the thing that actually boots got configured. On a systemd-boot box
+# that is either a UKI (V11) or a Type #1 entry (V5); at least one must exist.
+if [ "${UKI_SDBOOT:-0}" -eq 1 ]; then
+    CHECKS=$((CHECKS + 1))
+    SDB_OK=0
+    if [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "${#UKI_PATHS[@]}" -gt 0 ]; then
+        log "  V13 OK: systemd-boot boots ${#UKI_PATHS[@]} UKI(s) — covered by V11"
+        SDB_OK=1
+    fi
+    for sdb_dir in /mnt/efi /mnt/boot /mnt/boot/efi; do
+        [ -d "$sdb_dir/loader/entries" ] || continue
+        for sdb_entry in "$sdb_dir"/loader/entries/*.conf; do
+            [ -f "$sdb_entry" ] || continue
+            if [ -z "$LUKS_BOOT_ARGS" ] || grep -qF "$LUKS_BOOT_ARGS" "$sdb_entry"; then
+                SDB_OK=1
+            fi
+        done
+    done
+    if [ "$SDB_OK" -eq 1 ]; then
+        log "  V13 OK: systemd-boot has at least one bootable entry pointing at the encrypted root"
+    else
+        err "  V13 FAIL: systemd-boot found ($UKI_SDBOOT_DETAIL) but nothing it can boot"
+        err "            carries the LUKS arguments — the machine will not unlock!"
+        ERRORS=$((ERRORS + 1))
+    fi
+else
+    log "  V13 SKIP: systemd-boot not detected on this target"
+fi
+
 # Add chroot errors to total
 ERRORS=$((ERRORS + CHROOT_RC))
 
@@ -3050,6 +3548,10 @@ echo "  fstab       : /dev/mapper/$LUKS_NAME (was UUID=$ORIG_FS_UUID)"
 [ -n "$RPI_CMDLINE" ]            && echo "  cmdline.txt : root=/dev/mapper/$LUKS_NAME"
 [ -n "$EXTLINUX_CONF" ]          && echo "  extlinux    : root=/dev/mapper/$LUKS_NAME"
 echo "  initramfs   : ALL kernels rebuilt via $INITRAMFS_STYLE with LUKS unlock support"
+if [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "${#UKI_PATHS[@]}" -gt 0 ]; then
+    echo "  UKI         : ${#UKI_PATHS[@]} image(s) rebuilt via ${UKI_REGEN}, signed via ${UKI_SIGN} (Secure Boot: ${UKI_SB_STATE})"
+fi
+[ "${UKI_SDBOOT:-0}" -eq 1 ] && echo "  systemd-boot: $UKI_SDBOOT_DETAIL"
 echo "  header bkup : /boot/luks-header-backup.img + $STATE_DIR/"
 if [ -f "$STATE_DIR/recovery-key.txt" ]; then
     echo "  recovery key: $STATE_DIR/recovery-key.txt  ← MOVE TO SECURE OFFLINE STORAGE"
