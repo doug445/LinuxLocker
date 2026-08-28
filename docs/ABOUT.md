@@ -87,8 +87,8 @@ The three presets are 4 GiB × 10, 2 GiB × 8 and 1 GiB × 9 iterations, and the
 cheapest of them is a floor the tool will not write below — there is no override
 flag. A second guard measures what `cryptsetup` would have chosen unaided on
 that machine and raises the iteration count past it if the hardware is fast
-enough to have outrun the preset. The point is to beat a bare `luksFormat`,
-never to undercut it.
+enough to have outrun the preset. The point for this security utility is to beat 
+a bare `luksFormat`, never to undercut it. 
 
 **The reboot is gated.** The deploy script will not tell you to reboot until it
 has re-read the LUKS header, opened the container, confirmed the inner
