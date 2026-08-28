@@ -6,6 +6,9 @@ contact_links:
   - name: Security vulnerability
     url: https://github.com/doug445/LinuxLocker/blob/main/SECURITY.md
     about: Do not open a public issue. Report privately by email — see SECURITY.md.
+  - name: Test report — did it work on your setup?
+    url: https://github.com/doug445/LinuxLocker/blob/main/CONTRIBUTING.md#most-wanted-test-reports-from-other-setups
+    about: UKI, systemd-boot, Secure Boot, xfs, f2fs, Raspberry Pi and aarch64 hardware are all unconfirmed on metal. A report that it WORKED is as valuable as a bug.
   - name: What this project accepts
     url: https://github.com/doug445/LinuxLocker/blob/main/CONTRIBUTING.md
     about: Serious bugs and new filesystem support, and nothing else. Read before opening anything.

@@ -189,3 +189,92 @@ ll_ensure_tools() {
     echo "  All requested tools are now present."
     return 0
 }
+
+# ============================================================================
+# Apple Silicon / Fedora Asahi Remix guard
+# ============================================================================
+# LinuxLocker deliberately drops the Fedora Asahi Remix boot guards that
+# AsahiLocker carries. Asahi is not "Fedora on different hardware": the boot
+# chain is iBoot -> m1n1 -> U-Boot -> GRUB, /boot lives in its own partition
+# inside an APFS-adjacent layout the Apple firmware also reads, and the stub
+# partitions must not be touched by anything that assumes a normal ESP. A run
+# here would misidentify all of that. Refuse, and point at the right tool.
+#
+#   ll_detect_asahi <rootdir>   0 = this is Asahi / Apple Silicon; sets
+#                               LL_ASAHI_REASON. <rootdir> may be "" for the
+#                               live environment.
+#   ll_asahi_refuse <context>   print the refusal with a clickable link.
+
+LL_ASAHI_REASON=""
+LL_ASAHILOCKER_URL="https://github.com/doug445/AsahiLocker"
+
+ll_detect_asahi() {
+    local root="${1%/}" rel v d
+    LL_ASAHI_REASON=""
+
+    # 1. os-release. Fedora Asahi Remix keeps ID=fedora and marks itself in
+    #    VARIANT_ID / VARIANT / NAME, so ID alone never catches it.
+    rel="$root/etc/os-release"
+    [ -r "$rel" ] || rel="$root/usr/lib/os-release"
+    if [ -r "$rel" ]; then
+        v=$(grep -Ei '^(NAME|PRETTY_NAME|VARIANT|VARIANT_ID|ID)=' "$rel" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        case "$v" in
+            *asahi*) LL_ASAHI_REASON="os-release identifies Fedora Asahi Remix"; return 0 ;;
+        esac
+    fi
+
+    # 2. An Asahi kernel, by module directory name.
+    for d in "$root"/usr/lib/modules/*asahi*/ "$root"/lib/modules/*asahi*/; do
+        [ -d "$d" ] || continue
+        LL_ASAHI_REASON="Asahi kernel installed ($(basename "$d"))"
+        return 0
+    done
+
+    # 3. m1n1, the Apple Silicon first-stage bootloader. Nothing else ships it.
+    for d in "$root"/boot/efi/m1n1 "$root"/etc/default/m1n1 "$root"/usr/lib/asahi-boot; do
+        [ -e "$d" ] || continue
+        LL_ASAHI_REASON="m1n1 / asahi boot components present (${d#"$root"})"
+        return 0
+    done
+
+    # 4. The live environment running ON Apple Silicon, whatever the target is.
+    #    Only meaningful when probing the live system (empty root).
+    if [ -z "$root" ] && [ -r /proc/device-tree/compatible ]; then
+        if tr -d '\0' < /proc/device-tree/compatible 2>/dev/null | grep -q 'apple,'; then
+            LL_ASAHI_REASON="this machine is Apple Silicon (device-tree reports apple,*)"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Print a clickable link where the terminal supports OSC 8, and always print
+# the bare URL too — a hyperlink nobody can copy out of a screenshot is worse
+# than no hyperlink.
+ll_link() {   # $1 = url, $2 = link text
+    printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$2"
+}
+
+ll_asahi_refuse() {   # $1 = short context for the first line
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  WRONG TOOL — use AsahiLocker for Fedora Asahi Remix       ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  ${1:-Detected an Apple Silicon / Fedora Asahi Remix system.}"
+    [ -n "$LL_ASAHI_REASON" ] && echo "  Reason: $LL_ASAHI_REASON"
+    echo ""
+    echo "  LinuxLocker deliberately drops the Asahi boot guards, because on"
+    echo "  every other platform they are dead weight. Apple Silicon boots"
+    echo "  iBoot -> m1n1 -> U-Boot -> GRUB, and its stub partitions are read"
+    echo "  by the Apple firmware itself. Running this script here would"
+    echo "  misidentify the boot chain and could leave the machine unbootable"
+    echo "  in a way macOS recovery cannot fix for you."
+    echo ""
+    printf '  Use AsahiLocker instead:  '
+    ll_link "$LL_ASAHILOCKER_URL" "$LL_ASAHILOCKER_URL"
+    printf '\n\n'
+    echo "      git clone $LL_ASAHILOCKER_URL"
+    echo ""
+}

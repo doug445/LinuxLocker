@@ -1,5 +1,7 @@
 # Security Policy
 
+**LinuxLocker 1.2.0**
+
 ## Supported Versions
 
 LinuxLocker is maintained by one person and carries no backport branches. Fixes
@@ -113,12 +115,43 @@ interesting surface:
   environment, and inside the chroot when it installs `cryptsetup-initramfs`. A
   repository added without signature checking, a package pulled from an
   unverified source, or an install that lands in the wrong root is in scope.
+* **A Unified Kernel Image that is not what it claims to be.** The `.efi` is
+  the object the firmware actually loads; `crypttab`, `/etc/kernel/cmdline` and
+  the standalone initramfs are not. A run that rebuilds every one of those
+  correctly and leaves a stale `.efi` in place produces an unbootable machine
+  from a green report — the exact silent-pass class this project treats as a
+  vulnerability. Check V11 reads the `.cmdline` section back out of each rebuilt
+  UKI; V11 passing on a UKI that does **not** carry the LUKS arguments, or being
+  skipped when it could have run, is in scope.
+* **An unsigned UKI on a Secure Boot machine.** Rebuilding a UKI invalidates its
+  signature, and distro signing automation does not fire from a chroot — Arch's
+  `zz-sbctl.hook` is a libalpm hook, so a bare `mkinitcpio -P` rebuilds the image
+  and leaves it unsigned. Step 7g signs it and check V12 verifies that. V12
+  reporting a signed image that is not signed, or the deployment proceeding past
+  a failed signing with Secure Boot enabled, is a finding: the result is a
+  machine the firmware refuses to boot at all.
+* **A UKI refusal that fails to fire.** The two remaining refusals — no rebuild
+  backend, and Secure Boot enabled with no signer — run before the shrink and
+  before encryption, while aborting is still free. Either of them not firing on
+  a target that meets its condition is in scope, as is `sbctl` being claimed as
+  a signer when it has no key directory (it exits 0 having signed nothing).
+* **The Apple Silicon guard not guarding.** Fedora Asahi Remix and Apple Silicon
+  hardware are detected and refused before any device is touched, because this
+  tool drops the boot guards AsahiLocker carries. That refusal failing to fire
+  on an Asahi system is a serious bug, not a missing feature.
+* **The diagnostic bundle leaking key material.** `linuxlocker-diag.sh` is
+  read-only and is meant to be pasted into a public issue. Anything resembling
+  key material appearing in its output — a master key, header-backup contents,
+  a key file's contents, a passphrase — is a finding, and so is the UUID
+  redaction failing to apply when it was not disabled with `--no-redact`.
 * **A read-only tool that writes.** `luks-tune.sh` must never create or destroy
   a keyslot, change a passphrase, or touch data; `--dry-run` anywhere must reach
   no point of no return; `extras/luks-fetch-cache` must read public header
   metadata and nothing else, and its cache at `/var/cache/luks-fetch.txt` is
   world-readable by design, so anything resembling key material appearing in it
-  is a finding; `tests/loopback-core-test.sh` must touch no real disk.
+  is a finding; `bin/linuxlocker-diag.sh` must mount nothing read-write and
+  modify nothing; `tests/loopback-core-test.sh` must touch no real disk, and
+  `tests/uki-fixture-test.sh` must touch no disk at all.
 
 ## What is out of scope
 
@@ -147,6 +180,19 @@ interesting surface:
 
 **Read this one.** Unlike a networking tool, the artefacts this project produces
 can be the keys themselves.
+
+**Use the diagnostic bundle rather than assembling one by hand.** It is built to
+be safe to paste in public: it never runs `--dump-master-key`, never reads a key
+file's contents, and truncates UUIDs to eight characters unless you pass
+`--no-redact`.
+
+```bash
+sudo ./bin/linuxlocker-diag.sh -o linuxlocker-report.md
+```
+
+Read the file before you post it. The script is careful, but you are the last
+check on what leaves your machine — and for a **security** report, send it to
+the email address above rather than attaching it to an issue.
 
 * **Never send a LUKS header backup.** Not `/boot/luks-header-backup.img`, not
   the copy on the deployment drive, not one from a recovery bundle. It carries
