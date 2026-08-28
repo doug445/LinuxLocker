@@ -178,7 +178,7 @@ interesting surface:
 
 ## Before you send diagnostics
 
-**Read this one.** Unlike a networking tool, the artefacts this project produces
+**Read this one.** Unlike a networking tool, the artifacts this project produces
 can be the keys themselves.
 
 **Use the diagnostic bundle rather than assembling one by hand.** It is built to
