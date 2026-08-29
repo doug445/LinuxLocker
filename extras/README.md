@@ -3,7 +3,7 @@
 Optional. An aligned, one-line-per-volume summary of every LUKS and BitLocker
 encrypted volume attached to the machine, for use as a fastfetch module. The
 installer also installs **fastfetch itself** if it is missing, using your
-distro's package manager (via `bin/lib-deps.sh`).
+distro's package manager  (via `bin/lib-deps.sh`).
 
 ```bash
 sudo ./install.sh
