@@ -33,12 +33,12 @@ bug report** — it is the only way these rows ever get ticked.
 | GRUB + `update-grub` (Debian / Ubuntu / Mint) | long-standing path | still worth a report |
 | GRUB + `grub-mkconfig` (Arch / Manjaro) | long-standing path | still worth a report |
 | **systemd-boot, Type #1, ESP at `/boot`** | **untested on metal** | entries gained `rd.luks.*`; machine boots |
-| **systemd-boot, Type #1, ESP at `/efi` + XBOOTLDR `/boot`** | **untested on metal** | V13 passes; the old "no recognised bootloader" warning does *not* fire |
+| **systemd-boot, Type #1, ESP at `/efi` + XBOOTLDR `/boot`** | tested,works | V13 passes; the old "no recognised bootloader" warning does *not* fire |
 | **UKI via mkinitcpio preset (`_uki=`)** | **untested on metal** | `.cmdline` of the rebuilt `.efi` carries `rd.luks.*` |
 | **UKI via `kernel-install` (`layout=uki`)** | **untested on metal** | same, plus that each kernel got its own `.efi` |
 | **UKI via `dracut --uki-file`** | **untested on metal** | same |
 | **UKI via `ukify`** | **untested on metal** | same; this path needs a standalone initramfs to exist |
-| **Secure Boot + UKI, signed with `sbctl`** | **untested on metal** | `sbctl verify` lists the rebuilt `.efi`; firmware accepts it |
+| **Secure Boot + UKI, signed with `sbctl`** | tested,works | `sbctl verify` lists the rebuilt `.efi`; firmware accepts it |
 | **Secure Boot + UKI, signed with `sbsign`** | **untested on metal** | `sbverify --list` shows a signature; firmware accepts it |
 | **Secure Boot + shim + GRUB, no UKI** | **untested on metal** | genuinely no interaction; `mokutil --sb-state` unchanged |
 | **pesign / NSS targets (Fedora Secure Boot)** | refused by design | that the refusal fires and names pesign |
