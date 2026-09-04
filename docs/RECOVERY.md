@@ -101,7 +101,9 @@ cryptsetup luksHeaderRestore /dev/<part> --header-backup-file luks1-header-backu
 
 A keyslot that failed to re-cost to argon2id is still a working pbkdf2 slot —
 convert it later with `luks-tune.sh` or
-`cryptsetup luksConvertKey -S <slot> --pbkdf argon2id /dev/<part>`.
+`cryptsetup luksConvertKey -S <slot> --hash sha512 --pbkdf argon2id /dev/<part>`.
+Keep the `--hash sha512`: without it cryptsetup falls back to `sha256` and the
+slot's AF hash comes out lower than the one `linuxlocker.sh` formats with.
 
 ## Splash never came back
 
