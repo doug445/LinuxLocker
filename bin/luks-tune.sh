@@ -51,8 +51,12 @@
 #                    luksFormat time, so a header built by stock cryptsetup
 #                    keeps its sha256 digest no matter what is chosen here.
 # What it never does: create or destroy a keyslot, change a passphrase, touch
-#                    filesystem data, or offer pbkdf2. There is no code path
-#                    here that selects pbkdf2; see README, "Never use pbkdf2".
+#                    filesystem data, offer pbkdf2, or write a KDF that is
+#                    cheaper than the 'fast' floor OR cheaper than what the
+#                    keyslot already has. LinuxLocker hardens; a weaker keyslot is
+#                    a manual `cryptsetup luksConvertKey` run outside this tool.
+#                    There is no code path here that selects pbkdf2; see
+#                    README, "Never use pbkdf2".
 #
 # Volumes that GRUB itself unlocks (encrypted /boot) are RECOGNISED, through
 # bin/lib-boot.sh: the GRUB images on the disk and the volume's own layout
@@ -203,8 +207,10 @@ Its GRUB image could not be shown to embed the argon2 module
 supported'; a keyslot re-costed to argon2id would be one GRUB
 cannot open, and the machine would not boot.
 
-LinuxLocker never sets up or re-embeds an encrypted /boot and
-never writes pbkdf2 parameters, so nothing is offered here.
+LinuxLocker never sets up or re-embeds an encrypted /boot, and it
+hardens only: it never writes pbkdf2 or any weaker KDF, so nothing
+is offered here. A weaker keyslot is a manual cryptsetup
+luksConvertKey you run yourself, outside this tool.
 To strengthen this volume: build or install a GRUB with argon2
 support, re-run grub-install so the image embeds it, then come
 back. See docs/BOOTLOADERS.md, 'Encrypted /boot'." 20 74 || true
@@ -390,8 +396,33 @@ there is no 'proceed anyway' here.
 
 A slip like 1048 where you meant 1048576 also lands here.
 
-If you really want this, run cryptsetup luksConvertKey yourself." 18 70
+LinuxLocker hardens; it never writes a weaker KDF. A weaker keyslot is a
+manual  cryptsetup luksConvertKey  you run yourself, outside this tool." 18 70
     clear; exit 1
+fi
+
+# ─── Never weaker than the slot is now ──────────────────────────────────────
+# The static floor above catches cheap parameters; this catches a re-cost
+# that is cheaper than what the keyslot ALREADY has (an aggressive slot taken
+# down to fast, say). Either the memory drops, or the total work does — both
+# make the slot easier to attack, and this tool exists to do the opposite.
+# A pbkdf2 slot has no comparable memory cost: any argon2id is a hardening.
+if [ "$CUR_KDF" = "argon2id" ]; then
+    CUR_MEM_N=0; CUR_ITER_N=0
+    case "$CUR_MEM"  in ''|*[!0-9]*) ;; *) CUR_MEM_N=$CUR_MEM ;; esac
+    case "$CUR_ITER" in ''|*[!0-9]*) ;; *) CUR_ITER_N=$CUR_ITER ;; esac
+    if [ "$CUR_MEM_N" -gt 0 ] && [ "$CUR_ITER_N" -gt 0 ] \
+       && { [ "$NEW_MEM" -lt "$CUR_MEM_N" ] || [ $((NEW_MEM * NEW_ITER)) -lt $((CUR_MEM_N * CUR_ITER_N)) ]; }; then
+        ui --title "Weaker than the slot is now — refused" --msgbox \
+"Slot $SLOT already runs argon2id at $(human_mem "$CUR_MEM_N") x $CUR_ITER_N iterations.
+$(human_mem "$NEW_MEM") x $NEW_ITER iterations is cheaper per guess — lower
+memory, or less total work — and would make this keyslot easier
+to attack than it is today.
+
+LinuxLocker hardens; it never writes a weaker KDF. A weaker keyslot is a
+manual  cryptsetup luksConvertKey  you run yourself, outside this tool." 16 70
+        clear; exit 1
+    fi
 fi
 
 # ─── Refuse what GRUB cannot open ───────────────────────────────────────────
