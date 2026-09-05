@@ -260,12 +260,13 @@ never touches data, passphrases, or keyslot existence. It also converts
 leftover pbkdf2 keyslots to argon2id.
 
 On a volume that **GRUB itself unlocks** (an encrypted `/boot` you set up
-elsewhere), `luks-tune.sh` recognises that and offers only what GRUB can open:
-argon2id only when the GRUB image embeds the argon2 module (stock GRUB 2.12
-does not; a 2.14 build does), memory capped at **1 GiB** — argon2id needs its
-whole memory cost as one contiguous allocation from the firmware heap, and x86
-UEFI has never reliably handed out more — and every unlock estimate multiplied
-by GRUB's single-threaded slowdown (**8.5×**, measured on one machine;
+elsewhere), `luks-tune.sh` recognises that and still gives it the strongest
+KDF that GRUB can open: argon2id — memory-hard, GPU-resistant — whenever the
+GRUB image embeds the argon2 module (stock GRUB 2.12 does not; a 2.14 build
+does), at up to **1 GiB**, which is what argon2id can take as one contiguous
+allocation from the x86 UEFI firmware heap. The unlock estimate it shows is
+honest about where that unlock runs: GRUB is single-threaded, so the figure is
+the kernel-side estimate times **8.5** (measured on one machine;
 `LUKS_GRUB_KDF_FACTOR` overrides it). Nothing here sets an encrypted `/boot` up
 or re-embeds a GRUB image.
 
@@ -447,15 +448,19 @@ volumes you encrypted earlier.
 
 ### Why is `/boot` left unencrypted?
 
-The root volume is unlocked by the initramfs, which can afford a real argon2id
-cost. An encrypted `/boot` has to be unlocked by GRUB, which is far more
-constrained: it runs the KDF single-threaded with no SIMD — about **8.5× slower**
-than the initramfs for the same parameters, measured — it takes argon2id's
-memory as **one contiguous allocation** from the firmware heap, which on x86
-UEFI has never reliably meant more than **1 GiB** (4 GiB overflows GRUB
-outright), and whether it can open argon2id at all depends on the build: stock
-GRUB 2.12 prints *Argon2 not supported*. Weakening the root KDF to fit the
-bootloader trades a strong defence for a partial one.
+Because the root keyslot is where the strength lives. The initramfs unlocks
+root with the full argon2id cost — up to 4 GiB of memory per guess, which is
+what holds a GPU fleet to a handful of parallel attempts. An encrypted `/boot`
+would have to be opened by GRUB instead, and GRUB cannot deliver that: it takes
+argon2id's memory as **one contiguous allocation** from the firmware heap,
+which on x86 UEFI has never reliably meant more than **1 GiB** (4 GiB overflows
+GRUB outright), and whether it can open argon2id at all depends on the build
+(stock GRUB 2.12 prints *Argon2 not supported*). A `/boot` keyslot would
+therefore be the cheapest way into the machine — a quarter of the memory cost
+of an aggressive root — and every unlock would run single-threaded in GRUB,
+about 8.5× the initramfs time for the same parameters. Fitting the KDF to the
+bootloader trades a strong defence for a partial one; leaving `/boot` clear
+keeps the strong one.
 
 So LinuxLocker **recognises** encrypted `/boot` and **never sets it up**:
 
@@ -673,7 +678,7 @@ recovery bundle are key material, not diagnostics.
 
 MIT — see [LICENSE](LICENSE).
 
-- **Version:** 1.4.1
+- **Version:** 1.4.2
 - **Author:** William MacKinnon ([doug445](https://github.com/doug445))
 - **Email:** spilled-bowline0j@icloud.com
 - **Repository:** https://github.com/doug445/LinuxLocker

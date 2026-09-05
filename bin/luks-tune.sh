@@ -220,20 +220,21 @@ back. See docs/BOOTLOADERS.md, 'Encrypted /boot'." 20 74 || true
 "GRUB itself opens $DEV at boot (encrypted /boot):
   $BT_GRUB_EVIDENCE
 
-Its GRUB image embeds the argon2 module, so argon2id keyslots
-can be re-costed — within what GRUB can do:
+Its GRUB image embeds the argon2 module, so this keyslot can have
+the strongest KDF GRUB can open — argon2id, memory-hard, the cost a
+GPU fleet has to pay per guess — within what GRUB can allocate:
 
-  memory   capped at $(( BT_GRUB_ARGON2_MAX_KIB / 1024 )) MiB. argon2id needs its whole
-           memory cost as ONE contiguous allocation from the
-           firmware heap; x86 UEFI has never reliably given
-           more than 1 GiB (4 GiB overflows GRUB outright).
-  time     GRUB runs the KDF single-threaded with no SIMD. The
-           unlock estimates below are multiplied by ${BT_GRUB_KDF_FACTOR}
-           (measured on one machine; LUKS_GRUB_KDF_FACTOR overrides).
+  memory   up to $(( BT_GRUB_ARGON2_MAX_KIB / 1024 )) MiB. argon2id needs its whole memory cost
+           as ONE contiguous allocation from the firmware heap;
+           x86 UEFI has never reliably given more than 1 GiB
+           (4 GiB overflows GRUB outright).
+  time     GRUB runs the KDF single-threaded with no SIMD, so the
+           unlock estimates below are stated for GRUB: kernel-side
+           x ${BT_GRUB_KDF_FACTOR} (measured on one machine; LUKS_GRUB_KDF_FACTOR overrides).
   wall     long uninterrupted compute inside GRUB has tripped a
            firmware watchdog past ~${BT_GRUB_RESET_WALL_S} s on some hardware.
 
-Only the 1 GiB profile and a custom cost within the cap are offered." 22 74 || { clear; exit 0; }
+The 1 GiB profile and a custom cost within the cap are offered." 22 74 || { clear; exit 0; }
     fi
 fi
 
