@@ -283,7 +283,7 @@ or re-embeds a GRUB image.
 | `bin/lib-boot.sh` | Kernel command-line carriers and encrypted-`/boot` recognition (sourced, not run). One transform for every file format that carries a command line — BLS/systemd-boot entries in any ESP layout, `extlinux.conf`, `cmdline.txt`, `/etc/kernel/cmdline`, `cmdline.d`, `refind_linux.conf`, `limine.conf`, GRUB defaults and `grub.d` drop-ins — rewriting `root=`/`resume=` to the mapper, adding the unlock arguments, stripping and restoring the splash, without touching a line it does not understand. Also reads the GRUB images on a disk to tell whether GRUB itself unlocks a volume and whether it can read LUKS2 / open argon2id. |
 | `bin/luks-tune.sh` | ncurses KDF re-costing for existing LUKS2 volumes. Pins `--hash sha512` so a re-cost cannot walk a slot's AF hash back to cryptsetup's `sha256` default. `--dry-run` prints the command and changes nothing. |
 | `bin/post-encryption-setup.sh` | Run once on the newly-encrypted system: recovery bundle, snapper subvolumes (btrfs roots), splash-argument restore, verification. Idempotent. |
-| `bin/save-luks-recovery-bundle.sh` | Labeled recovery bundle: fresh header backup + crypttab/fstab/boot state + a README with distro-specific repair commands. **Key material — never attach it to a bug report.** |
+| `bin/save-luks-recovery-bundle.sh` | Labeled recovery bundle: a fresh, **verified** header backup of **every** LUKS volume on the machine (not just root), the public `luksDump` of each, the **partition table** of every disk holding one (`sfdisk --dump`, so a header backup is never a puzzle about offsets), crypttab/fstab/every command-line carrier/boot entries/EFI boot variables, sha256 sums, and a README with the repair steps for this machine's initramfs style and the checks to make before any header is restored. Refreshes a stale `/boot` emergency copy (keeping the old one). Key files named in crypttab are listed, never copied. `--dry-run` writes nothing. **Key material — never attach it to a bug report.** |
 | `bin/linuxlocker-diag.sh` | **Read-only diagnostic bundle for bug reports**, as Markdown you can paste straight into an issue: tool inventory, `lsblk -f`, Secure Boot state, the target's boot configuration, the baked-in `.cmdline` of every UKI and its signature status, what LinuxLocker's own detection thinks it found, public LUKS header metadata, and the relevant journal lines. UUIDs truncated by default. Also reachable as `linuxlocker.sh diag`. |
 | `extras/` | Optional: `luks-fetch-cache`, a disk-encryption status readout for fastfetch (LUKS **and** BitLocker volumes — KDF, cipher, protectors; public header metadata only). Its `install.sh` also installs fastfetch itself if missing. |
 | `tests/loopback-core-test.sh` | CI-safe loopback test of the whole core: shrink guards, reencrypt, resume, hard-kill repair, recovery keys, the ext4 path, and LUKS1→LUKS2 conversion. Touches no real disk, and runs on every push against x86_64 **and** aarch64 runners. |
@@ -721,7 +721,7 @@ author's, the audit checked that the code keeps them.
 
 MIT — see [LICENSE](LICENSE).
 
-- **Version:** 1.5.0
+- **Version:** 1.5.1
 - **Author:** William MacKinnon ([doug445](https://github.com/doug445))
 - **Email:** spilled-bowline0j@icloud.com
 - **Repository:** https://github.com/doug445/LinuxLocker
