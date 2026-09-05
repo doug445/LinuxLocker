@@ -507,7 +507,7 @@ bt_grub_probe() {
 
     uuid=$(cryptsetup luksUUID "$dev" 2>/dev/null || blkid -s UUID -o value "$dev" 2>/dev/null || true)
     nodash=$(printf '%s' "$uuid" | tr -d '-' | tr '[:upper:]' '[:lower:]')
-    disk=$(lsblk -no PKNAME "$dev" 2>/dev/null | head -1)
+    disk=$(lsblk -dno PKNAME "$dev" 2>/dev/null | head -1)
 
     # 1. Images and stubs on every FAT partition of this disk.
     if [ -n "$disk" ]; then
