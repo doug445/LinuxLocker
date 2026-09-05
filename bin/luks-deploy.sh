@@ -834,7 +834,7 @@ echo ""
 
 # Identify the live USB's disk so we can deprioritize its partitions
 LIVE_ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*//')
-LIVE_ROOT_DISK=$(lsblk -no PKNAME "$LIVE_ROOT_DEV" 2>/dev/null | head -1)
+LIVE_ROOT_DISK=$(lsblk -dno PKNAME "$LIVE_ROOT_DEV" 2>/dev/null | head -1)
 log "Live environment disk: ${LIVE_ROOT_DISK:-(unknown)}"
 
 pick_partition() {
@@ -1701,7 +1701,7 @@ elif [ -n "$BOOT_IN_VOLUME" ]; then
 fi
 
 # ─── Same-Disk Sanity Check ──────────────────────────────────────────────────
-DISK_ROOT=$(lsblk -no PKNAME "$TARGET_ROOT" 2>/dev/null | head -n1)
+DISK_ROOT=$(lsblk -dno PKNAME "$TARGET_ROOT" 2>/dev/null | head -n1)
 
 # An ESP or XBOOTLDR partition the target never lists in fstab is mounted at
 # boot by systemd-gpt-auto-generator, not by fstab. Nothing here can tell that
@@ -1729,7 +1729,7 @@ if [ "$SYSTEM_MODE" -eq 1 ] && [ -n "$DISK_ROOT" ] && [ -d /sys/firmware/efi ]; 
     fi
 fi
 for i in "${!MNT_MPS[@]}"; do
-    d=$(lsblk -no PKNAME "${MNT_DEVS[$i]}" 2>/dev/null | head -n1)
+    d=$(lsblk -dno PKNAME "${MNT_DEVS[$i]}" 2>/dev/null | head -n1)
     if [ -n "$d" ] && [ "$d" != "$DISK_ROOT" ]; then
         warn "${MNT_MPS[$i]} (${MNT_DEVS[$i]}) is on disk '$d' but ROOT is on '$DISK_ROOT'!"
         read -p "Proceed with partitions on different disks? (yes/no): " cross_disk
