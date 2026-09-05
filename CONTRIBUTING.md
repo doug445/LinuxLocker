@@ -172,8 +172,9 @@ Run what CI runs:
 
 ```bash
 shellcheck -S warning $(git ls-files '*.sh') extras/bin/luks-fetch-cache
-sudo bash tests/loopback-core-test.sh      # expect 29 passed, 0 failed
+sudo bash tests/loopback-core-test.sh      # expect 31 passed, 0 failed
 bash tests/uki-fixture-test.sh             # expect 0 failed
+bash tests/cmdline-fixture-test.sh         # expect 0 failed
 ```
 
 On a machine that boots a UKI, run the fixture suite **as root** as well:

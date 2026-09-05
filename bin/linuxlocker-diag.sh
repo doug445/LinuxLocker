@@ -34,7 +34,7 @@
 # ============================================================================
 set -uo pipefail
 
-LL_VERSION="1.3.0"
+LL_VERSION="1.4.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REDACT=1
 OUTFILE=""
@@ -211,11 +211,51 @@ file_sec "/etc/default/grub"     "$ROOT/etc/default/grub"
 file_sec "/proc/cmdline (currently running kernel)" /proc/cmdline
 
 echo ""
+echo "### Other kernel command-line carriers"
+echo ""
+echo "_Every file lib-boot.sh recognises as carrying a kernel command line —"
+echo "GRUB drop-ins (they override /etc/default/grub), cmdline.d, systemd-boot"
+echo "entries wherever the ESP is, extlinux, cmdline.txt, rEFInd, Limine._"
+echo ""
+echo '```'
+if [ -f "$SCRIPT_DIR/lib-boot.sh" ]; then
+    # shellcheck source=lib-boot.sh
+    . "$SCRIPT_DIR/lib-boot.sh"
+    CARRIERS=$(cl_find_carriers "$ROOT")
+    if [ -n "$CARRIERS" ]; then
+        while IFS=$'\t' read -r ckind cpath; do
+            [ -n "$cpath" ] || continue
+            echo "--- [$ckind] ${cpath#"$ROOT"} ---"
+            case "$ckind" in
+                grubd|limine-default) grep -E '^[[:space:]]*[A-Z_]+(\[[^]]*\])?=' "$cpath" | redact ;;
+                *) redact < "$cpath" ;;
+            esac
+        done <<< "$CARRIERS"
+    else
+        echo "(none beyond /etc/default/grub and /etc/kernel/cmdline)"
+    fi
+    if [ -f "$ROOT/etc/default/grub" ]; then
+        echo "--- effective GRUB_CMDLINE_LINUX after /etc/default/grub.d/*.cfg ---"
+        cl_grub_effective "$ROOT" GRUB_CMDLINE_LINUX | redact; echo
+        echo "--- effective GRUB_CMDLINE_LINUX_DEFAULT ---"
+        cl_grub_effective "$ROOT" GRUB_CMDLINE_LINUX_DEFAULT | redact; echo
+    fi
+else
+    echo "(bin/lib-boot.sh not found next to this script)"
+fi
+echo '```'
+
+echo ""
 echo "### Mount points of the boot partitions"
 echo ""
 echo '```'
-findmnt -n -o SOURCE,TARGET,FSTYPE /boot /efi /boot/efi /boot/firmware 2>/dev/null | redact \
-    || echo "(none of /boot /efi /boot/efi /boot/firmware are mounted)"
+# One target per call: findmnt takes a single mountpoint argument, and with
+# several it errors out — which used to print "none mounted" on every machine.
+BOOT_MOUNTED=0
+for bm in /boot /efi /boot/efi /boot/firmware; do
+    findmnt -n -o SOURCE,TARGET,FSTYPE "$bm" 2>/dev/null | redact && BOOT_MOUNTED=1
+done
+[ "$BOOT_MOUNTED" -eq 1 ] || echo "(none of /boot /efi /boot/efi /boot/firmware are mounted)"
 echo '```'
 
 echo ""
@@ -366,6 +406,33 @@ if [ -f "$SCRIPT_DIR/lib-deps.sh" ]; then
     else
         echo "Apple Silicon/Asahi : no"
     fi
+fi
+echo '```'
+
+echo ""
+echo "### Encrypted /boot recognition"
+echo ""
+echo "_Whether GRUB itself unlocks each LUKS volume (encrypted /boot), and what"
+echo "its image can do — read from the GRUB images on the disk and the volume's"
+echo "own layout. LinuxLocker recognises this and never sets it up._"
+echo ""
+echo '```'
+if declare -F bt_grub_probe >/dev/null 2>&1; then
+    DIAG_LUKS_DEVS=""
+    if [ -n "$TARGET" ]; then DIAG_LUKS_DEVS="$TARGET"
+    else DIAG_LUKS_DEVS=$(lsblk -rno NAME,FSTYPE | awk '$2=="crypto_LUKS"{print "/dev/"$1}'); fi
+    if [ -z "$DIAG_LUKS_DEVS" ]; then
+        echo "(no crypto_LUKS partitions found)"
+    fi
+    for d in $DIAG_LUKS_DEVS; do
+        echo "===== $d ====="
+        if [ -n "$ROOT" ] || [ -f /etc/fstab ]; then bt_grub_probe "$d" "$ROOT"; else bt_grub_probe "$d"; fi
+        bt_grub_summary | redact
+        echo ""
+    done
+    echo "GRUB argon2id ceiling : $((BT_GRUB_ARGON2_MAX_KIB / 1024)) MiB   unlock-time factor: ${BT_GRUB_KDF_FACTOR}x"
+else
+    echo "(bin/lib-boot.sh not found next to this script)"
 fi
 echo '```'
 

@@ -48,6 +48,16 @@ Inside the chroot, check in this order:
    - mkinitcpio (systemd): `rd.luks.name=<uuid>=root_crypt`
    - initramfs-tools: none needed — crypttab drives it
    - Raspberry Pi: `cmdline.txt` must say `root=/dev/mapper/root_crypt`
+
+   …in **every** file that carries the command line on your machine, and any
+   `root=`/`resume=` there that names the raw partition (`PARTUUID=`,
+   `/dev/sdXn`) must say `/dev/mapper/root_crypt` instead. `root=UUID=` with
+   the filesystem's UUID is fine. Where to look: `/etc/default/grub` **and**
+   `/etc/default/grub.d/*.cfg` (drop-ins override the main file), `/etc/kernel/cmdline`,
+   `/etc/cmdline.d/*.conf`, `loader/entries/*.conf` under `/boot`, `/efi` or
+   `/boot/efi`, `cmdline.txt`, `extlinux.conf`, `refind_linux.conf`,
+   `limine.conf`. `sudo ./bin/linuxlocker-diag.sh` lists the ones it finds and
+   prints the *effective* GRUB values after the drop-ins.
 4. Rebuild the initramfs:
    - `dracut --regenerate-all --force`
    - `update-initramfs -u -k all`
@@ -83,8 +93,10 @@ type/paste it at the boot prompt, or from a live USB:
 cryptsetup open /dev/<rootpart> root_crypt --key-file recovery-key.txt
 ```
 
-Then set a new passphrase: `cryptsetup luksAddKey /dev/<rootpart>
+Then set a new passphrase: `cryptsetup luksAddKey --hash sha512 /dev/<rootpart>
 --key-file recovery-key.txt`, and remove the old slot with `luksKillSlot`.
+Keep the `--hash sha512`: a keyslot added without it gets cryptsetup's sha256
+AF hash, one step below what the rest of the header was formatted with.
 
 No recovery key and no passphrase = no data. There is no bypass; that is the
 security property you installed.

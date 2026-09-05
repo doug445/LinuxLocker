@@ -147,6 +147,14 @@ if [ -f "$SCRIPT_DIR/lib-uki.sh" ]; then
     LL_HAVE_UKI_LIB=1
 fi
 
+# ─── Kernel command-line carriers + encrypted-/boot recognition ──────────────
+# Not optional: stages 6d-6h, the splash strip, checks V3/V11/V14 and the
+# refusal of /boot-inside-the-volume targets all go through it.
+[ -f "$SCRIPT_DIR/lib-boot.sh" ] \
+    || fatal "lib-boot.sh not found next to this script — the bin/ directory is incomplete."
+# shellcheck source=lib-boot.sh
+. "$SCRIPT_DIR/lib-boot.sh"
+
 # ─── Apple Silicon / Fedora Asahi Remix — wrong tool, stop here ──────────────
 # Checked before ANY device is touched. AsahiLocker carries the boot guards
 # this script deliberately drops; running here risks an unbootable Mac.
@@ -256,11 +264,29 @@ harden_path() {                        # harden_path <octal-mode> <path>
 #   LUKS_DRY_RUN=1 (or --dry-run flag)  preview: full detection + plan, no
 #                                       changes to the target, exit before
 #                                       the point of no return
+#   LUKS_GRUB_KDF_FACTOR=<x>     unlock-time multiplier shown for a volume that
+#                                GRUB itself unlocks (encrypted /boot). Default
+#                                8.5, measured on one machine; see lib-boot.sh
+#   LUKS_GRUB_ARGON2_MAX_KIB=<n> argon2id memory ceiling for such a volume.
+#                                Default 1 GiB — the x86 UEFI contiguous heap
+#
+# Encrypted /boot is RECOGNISED, never set up. A target whose /boot lives on
+# the root filesystem under GRUB or extlinux is refused before the shrink: the
+# bootloader would have to unlock the volume itself, and LinuxLocker does not
+# re-embed GRUB images, does not offer pbkdf2, and will not put a keyslot
+# where a single-threaded bootloader with a 1 GiB heap has to open it. On a
+# volume GRUB already unlocks, the only thing offered is KDF tuning within
+# that ceiling, with the unlock estimate multiplied by GRUB's slowdown.
 
 KDF_PROFILE_AGGRESSIVE_MEM=4194304;  KDF_PROFILE_AGGRESSIVE_ITER=10
 KDF_PROFILE_MODERATE_MEM=2097152;    KDF_PROFILE_MODERATE_ITER=8
 KDF_PROFILE_FAST_MEM=1048576;        KDF_PROFILE_FAST_ITER=9
 KDF_DEFAULT_PARALLEL=4
+
+# This machine's RAM, needed wherever a memory cost is chosen — the profile
+# menu, the LUKS1 conversion re-cost, and the pinned-parameter check.
+MEM_TOTAL_KIB=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+case "$MEM_TOTAL_KIB" in ''|*[!0-9]*) MEM_TOTAL_KIB=0;; esac
 
 # Did the caller pin anything explicitly? (checked before defaults are applied)
 KDF_PINNED_BY_ENV=0
@@ -633,7 +659,7 @@ cleanup() {
     # inside /mnt_temp, and a plain umount would fail on the child mount)
     umount -R /mnt_temp 2>/dev/null || umount /mnt_temp 2>/dev/null || true
     rmdir /mnt_temp 2>/dev/null || true
-    for uki_probe_dir in /tmp/luks-uki-probe.*; do
+    for uki_probe_dir in /tmp/luks-uki-probe.* /tmp/luks-grub-probe.*; do
         [ -d "$uki_probe_dir" ] || continue
         umount "$uki_probe_dir" 2>/dev/null || true
         rmdir "$uki_probe_dir" 2>/dev/null || true
@@ -650,7 +676,8 @@ cleanup() {
     umount /mnt/home 2>/dev/null || true
     umount /mnt 2>/dev/null || true
     cryptsetup close ${LUKS_NAME} 2>/dev/null || true
-    rm -f /mnt/tmp/.luks-deploy-env 2>/dev/null || true
+    cryptsetup close "luks-probe-$$" 2>/dev/null || true
+    rm -f /mnt/tmp/.luks-deploy-env /mnt/tmp/.luks-lib-uki.sh /mnt/tmp/.luks-lib-boot.sh 2>/dev/null || true
     if [ $exit_code -ne 0 ]; then
         echo ""
         echo "Recovery options:"
@@ -971,8 +998,11 @@ fi
 ensure_unmounted() {
     # $1 = device; offer to unmount every mountpoint it currently has
     local dev="$1" mps mp
+    # findmnt -S lists every mountpoint of a source on any util-linux; lsblk's
+    # MOUNTPOINTS column only arrived in 2.37, and on older live media the
+    # old lsblk call errored out and this guard silently passed.
     # sort -r: unmount nested child mounts (/mnt/home) before parents (/mnt)
-    mps=$(lsblk -no MOUNTPOINTS "$dev" 2>/dev/null | grep -v '^$' | sort -r || true)
+    mps=$(findmnt -rno TARGET -S "$dev" 2>/dev/null | grep -v '^$' | sort -r || true)
     [ -n "$mps" ] || return 0
     warn "$dev is currently mounted at:"
     echo "$mps" | sed 's/^/    /'
@@ -1039,19 +1069,98 @@ convert_luks1() {
     echo "  The data is NOT re-encrypted and is not touched; only the header"
     echo "  and keyslot areas change. A full header backup is taken first."
     echo ""
-    err "  ┌──────────────────────────────────────────────────────────────┐"
-    err "  │ IMPORTANT: if GRUB itself unlocks this volume at boot        │"
-    err "  │ (encrypted /boot, GRUB_ENABLE_CRYPTODISK + cryptomount —     │"
-    err "  │ common on older Debian/Ubuntu full-disk installs), GRUB      │"
-    err "  │ cannot open argon2id keyslots. Converting the keyslots       │"
-    err "  │ would make that system UNBOOTABLE. Only proceed if the       │"
-    err "  │ passphrase prompt at boot comes from the initramfs (the      │"
-    err "  │ common case), not from GRUB itself.                          │"
-    err "  └──────────────────────────────────────────────────────────────┘"
-    echo ""
+
+    # ── Does GRUB itself unlock this volume? (encrypted /boot) ─────────────
+    # Two things brick such a system: a LUKS2 header its GRUB cannot read
+    # (LUKS2 support arrived in GRUB 2.06), and an argon2id keyslot its GRUB
+    # has no code for (stock 2.12 prints "Argon2 not supported"). The GRUB
+    # images on this disk are inspected first; if they do not settle it, the
+    # volume is opened read-only and its own layout is checked.
+    bt_grub_probe "$dev"
+    if [ "$BT_GRUB_UNLOCKS" -eq 0 ] && [ "$DRY_RUN" != "1" ]; then
+        log "  Checking whether GRUB itself unlocks this volume — it is opened read-only"
+        log "  for a look at its fstab (enter the passphrase)..."
+        if cryptsetup open --readonly "${CRYPT_PASS_ARGS[@]}" "$dev" "luks-probe-$$"; then
+            local pfs psub="" ptry
+            pfs=$(blkid -s TYPE -o value "/dev/mapper/luks-probe-$$" 2>/dev/null || echo "")
+            mkdir -p /mnt_temp
+            if [ "$pfs" = "btrfs" ] && mount -o ro,subvolid=5 "/dev/mapper/luks-probe-$$" /mnt_temp 2>/dev/null; then
+                for ptry in root @rootfs @ ""; do
+                    [ -f "/mnt_temp/${ptry}${ptry:+/}etc/fstab" ] && { psub="${ptry}${ptry:+/}"; break; }
+                done
+                bt_grub_probe "$dev" "/mnt_temp/${psub%/}"
+                umount /mnt_temp
+            elif [ -n "$pfs" ] && mount -o ro "/dev/mapper/luks-probe-$$" /mnt_temp 2>/dev/null; then
+                bt_grub_probe "$dev" /mnt_temp
+                umount /mnt_temp
+            else
+                warn "  Could not mount the volume read-only ($pfs) — GRUB check inconclusive."
+            fi
+            rmdir /mnt_temp 2>/dev/null || true
+            cryptsetup close "luks-probe-$$"
+        else
+            fatal "Could not open $dev — wrong passphrase? Header unchanged."
+        fi
+    fi
+
+    GRUB_RECOST="any"          # any | fast-only | none
+    if [ "$BT_GRUB_UNLOCKS" -eq 1 ]; then
+        echo ""
+        err "  ┌──────────────────────────────────────────────────────────────┐"
+        err "  │ GRUB ITSELF unlocks this volume at boot (encrypted /boot).   │"
+        err "  └──────────────────────────────────────────────────────────────┘"
+        bt_grub_summary | sed 's/^/    /'
+        echo ""
+        if [ "$BT_GRUB_LUKS2" != "yes" ]; then
+            err "  The GRUB image on this disk could not be shown to read LUKS2"
+            err "  headers (support arrived in GRUB 2.06; result: $BT_GRUB_LUKS2)."
+            err "  Converting this header would leave GRUB unable to open /boot —"
+            err "  the machine would not boot."
+            echo ""
+            echo "  LinuxLocker never sets up or re-embeds an encrypted /boot. If you"
+            echo "  know your GRUB reads LUKS2, convert by hand and re-run grub-install"
+            echo "  so the image embeds the luks2 module:"
+            echo "      cryptsetup convert --type luks2 $dev"
+            echo "  See docs/BOOTLOADERS.md, 'Encrypted /boot'."
+            fatal "Refusing to convert a LUKS1 header that GRUB unlocks. Header unchanged."
+        fi
+        if [ "$BT_GRUB_ARGON2" = "yes" ]; then
+            GRUB_RECOST="fast-only"
+            warn "  The keyslots CAN be re-costed to argon2id: this GRUB embeds the"
+            warn "  argon2 module. GRUB runs the KDF single-threaded from the firmware"
+            warn "  heap, so only the 1 GiB profile is offered, and the unlock time"
+            warn "  shown is the kernel-side estimate x ${BT_GRUB_KDF_FACTOR} (measured on one machine)."
+        else
+            GRUB_RECOST="none"
+            warn "  The keyslots will stay pbkdf2: this GRUB has no argon2 code"
+            warn "  (result: $BT_GRUB_ARGON2). An argon2id keyslot would be one GRUB"
+            warn "  cannot open. LinuxLocker never writes pbkdf2 parameters, so the"
+            warn "  header is converted and the KDF is left exactly as it is."
+        fi
+        echo ""
+    else
+        # Not GRUB-unlocked as far as the images and the volume show. Keep
+        # the old operator gate: the operator may know something the disk
+        # does not say (a GRUB image on another disk, a USB /boot).
+        err "  ┌──────────────────────────────────────────────────────────────┐"
+        err "  │ IMPORTANT: if GRUB itself unlocks this volume at boot        │"
+        err "  │ (encrypted /boot, GRUB_ENABLE_CRYPTODISK + cryptomount —     │"
+        err "  │ common on older Debian/Ubuntu full-disk installs), GRUB      │"
+        err "  │ cannot open argon2id keyslots. Converting the keyslots       │"
+        err "  │ would make that system UNBOOTABLE. No evidence of that was   │"
+        err "  │ found on this disk — only proceed if the passphrase prompt   │"
+        err "  │ at boot comes from the initramfs, not from GRUB itself.      │"
+        err "  └──────────────────────────────────────────────────────────────┘"
+        echo ""
+    fi
     if [ "$DRY_RUN" = "1" ]; then
         log "[dry-run] Would back up the header, run 'cryptsetup convert --type luks2 $dev',"
-        log "[dry-run] then offer per-keyslot argon2id re-costing. Nothing was changed."
+        case "$GRUB_RECOST" in
+            any)       log "[dry-run] then offer per-keyslot argon2id re-costing (all three profiles)." ;;
+            fast-only) log "[dry-run] then offer per-keyslot argon2id re-costing (1 GiB only — GRUB unlocks it)." ;;
+            none)      log "[dry-run] and leave the keyslots on pbkdf2 (GRUB unlocks it and has no argon2)." ;;
+        esac
+        log "[dry-run] Nothing was changed."
         exit 0
     fi
     read -p "  Type 'CONVERT' to convert this LUKS1 header to LUKS2: " CONFIRM_CONV
@@ -1070,7 +1179,9 @@ convert_luks1() {
     mkdir -p "$state_dir"
     harden_path 0700 "$state_dir"
     hdr_backup="$state_dir/luks1-header-backup.img"
-    cryptsetup luksHeaderBackup "$dev" --header-backup-file "$hdr_backup" \
+    # umask 077: luksHeaderBackup creates the file itself and refuses to
+    # overwrite, so the mode has to be right at creation, not chmod'd after.
+    ( umask 077; cryptsetup luksHeaderBackup "$dev" --header-backup-file "$hdr_backup" ) \
         || fatal "Header backup failed — refusing to convert without one."
     harden_path 0400 "$hdr_backup"
     log "  LUKS1 header backed up to: $hdr_backup"
@@ -1081,41 +1192,90 @@ convert_luks1() {
     log "  Header converted to LUKS2."
 
     # ── Re-cost the keyslots to argon2id ────────────────────────────────────
-    echo ""
-    echo "  The keyslots still use pbkdf2 (carried over from LUKS1)."
-    echo "  Re-costing them to argon2id gives the volume the same GPU-resistant"
-    echo "  KDF a fresh LinuxLocker deployment gets. Pick a profile:"
-    echo ""
-    EST_AGG=$(kdf_estimate_ms "$KDF_PROFILE_AGGRESSIVE_MEM" "$KDF_PROFILE_AGGRESSIVE_ITER" "$KDF_DEFAULT_PARALLEL" || echo "")
-    EST_MOD=$(kdf_estimate_ms "$KDF_PROFILE_MODERATE_MEM"   "$KDF_PROFILE_MODERATE_ITER"   "$KDF_DEFAULT_PARALLEL" || echo "")
-    EST_FAST=$(kdf_estimate_ms "$KDF_PROFILE_FAST_MEM"      "$KDF_PROFILE_FAST_ITER"       "$KDF_DEFAULT_PARALLEL" || echo "")
-    printf "   1) aggressive    4 GiB, 10 iterations    unlock ~%s\n" "$(kdf_fmt_ms "${EST_AGG:-}")"
-    printf "   2) moderate      2 GiB,  8 iterations    unlock ~%s   [default]\n" "$(kdf_fmt_ms "${EST_MOD:-}")"
-    printf "   3) fast          1 GiB,  9 iterations    unlock ~%s\n" "$(kdf_fmt_ms "${EST_FAST:-}")"
-    echo   "   4) skip — keep pbkdf2 for now (re-run later, or use luks-tune.sh)"
-    echo ""
-    while true; do
-        read -p "  Select [1-4, default 2=moderate]: " KDF_CHOICE
-        case "${KDF_CHOICE:-2}" in
-            1) profile=aggressive; apply_kdf_profile aggressive; break ;;
-            2) profile=moderate;   apply_kdf_profile moderate;   break ;;
-            3) profile=fast;       apply_kdf_profile fast;       break ;;
-            4) profile=skip; break ;;
-            *) echo "  Invalid selection '$KDF_CHOICE' — enter 1, 2, 3 or 4." ;;
-        esac
-    done
+    profile=skip
+    if [ "$GRUB_RECOST" = "none" ]; then
+        echo ""
+        log "  Keyslots left on pbkdf2 — GRUB unlocks this volume and cannot open argon2id."
+    else
+        echo ""
+        echo "  The keyslots still use pbkdf2 (carried over from LUKS1)."
+        echo "  Re-costing them to argon2id gives the volume the same GPU-resistant"
+        echo "  KDF a fresh LinuxLocker deployment gets. Pick a profile:"
+        echo ""
+        EST_AGG=$(kdf_estimate_ms "$KDF_PROFILE_AGGRESSIVE_MEM" "$KDF_PROFILE_AGGRESSIVE_ITER" "$KDF_DEFAULT_PARALLEL" || echo "")
+        EST_MOD=$(kdf_estimate_ms "$KDF_PROFILE_MODERATE_MEM"   "$KDF_PROFILE_MODERATE_ITER"   "$KDF_DEFAULT_PARALLEL" || echo "")
+        EST_FAST=$(kdf_estimate_ms "$KDF_PROFILE_FAST_MEM"      "$KDF_PROFILE_FAST_ITER"       "$KDF_DEFAULT_PARALLEL" || echo "")
+        if [ "$GRUB_RECOST" = "fast-only" ]; then
+            # GRUB does this unlock: single-threaded, no SIMD, firmware heap.
+            EST_FAST_GRUB=$(bt_grub_ms "${EST_FAST:-}" || echo "")
+            printf "   3) fast          1 GiB,  9 iterations    unlock ~%s in GRUB (~%s kernel-side)\n" \
+                "$(kdf_fmt_ms "${EST_FAST_GRUB:-}")" "$(kdf_fmt_ms "${EST_FAST:-}")"
+            echo   "   4) skip — keep pbkdf2 (re-run later, or use luks-tune.sh)"
+            echo ""
+            echo "   aggressive (4 GiB) and moderate (2 GiB) are not offered: GRUB takes"
+            echo "   argon2id's memory as ONE contiguous block from the firmware heap,"
+            echo "   and x86 UEFI has never reliably given out more than 1 GiB."
+            if [ -n "${EST_FAST_GRUB:-}" ] && [ "$EST_FAST_GRUB" -ge $((BT_GRUB_RESET_WALL_S * 1000)) ]; then
+                warn "   ~$(kdf_fmt_ms "$EST_FAST_GRUB") of uninterrupted compute inside GRUB: firmware"
+                warn "   watchdogs have been seen to reset a machine past ~${BT_GRUB_RESET_WALL_S} s. Consider"
+                warn "   keeping pbkdf2, or a custom cost via luks-tune.sh."
+            fi
+            echo ""
+            while true; do
+                read -p "  Select [3-4, default 4=skip]: " KDF_CHOICE
+                case "${KDF_CHOICE:-4}" in
+                    3) profile=fast; apply_kdf_profile fast; break ;;
+                    4) profile=skip; break ;;
+                    *) echo "  Invalid selection '$KDF_CHOICE' — enter 3 or 4." ;;
+                esac
+            done
+        else
+            printf "   1) aggressive    4 GiB, 10 iterations    unlock ~%s\n" "$(kdf_fmt_ms "${EST_AGG:-}")"
+            printf "   2) moderate      2 GiB,  8 iterations    unlock ~%s   [default]\n" "$(kdf_fmt_ms "${EST_MOD:-}")"
+            printf "   3) fast          1 GiB,  9 iterations    unlock ~%s\n" "$(kdf_fmt_ms "${EST_FAST:-}")"
+            echo   "   4) skip — keep pbkdf2 for now (re-run later, or use luks-tune.sh)"
+            if [ "$MEM_TOTAL_KIB" -gt 0 ] && [ "$MEM_TOTAL_KIB" -lt $((6 * 1024 * 1024)) ]; then
+                echo ""
+                echo -e "   ${YELLOW}This machine has $((MEM_TOTAL_KIB / 1024 / 1024)) GiB RAM — 'aggressive' (4 GiB) is NOT safe"
+                echo -e "   here; the unlock could OOM at boot. Pick moderate or fast.${NC}"
+            fi
+            echo ""
+            while true; do
+                read -p "  Select [1-4, default 2=moderate]: " KDF_CHOICE
+                case "${KDF_CHOICE:-2}" in
+                    1) profile=aggressive; apply_kdf_profile aggressive ;;
+                    2) profile=moderate;   apply_kdf_profile moderate ;;
+                    3) profile=fast;       apply_kdf_profile fast ;;
+                    4) profile=skip; break ;;
+                    *) echo "  Invalid selection '$KDF_CHOICE' — enter 1, 2, 3 or 4."; continue ;;
+                esac
+                # The KDF re-runs at every boot on THIS machine; it must fit.
+                if [ "$MEM_TOTAL_KIB" -gt 0 ] && [ "$LUKS_PBKDF_MEMORY" -ge "$MEM_TOTAL_KIB" ]; then
+                    warn "  $profile needs $((LUKS_PBKDF_MEMORY / 1024)) MiB; this machine has $((MEM_TOTAL_KIB / 1024)) MiB. Pick a smaller profile."
+                    continue
+                fi
+                break
+            done
+        fi
+    fi
 
     if [ "$profile" != "skip" ]; then
         kdf_enforce_stock_floor
+        if [ "$GRUB_RECOST" = "fast-only" ] && ! bt_grub_mem_ok "$LUKS_PBKDF_MEMORY"; then
+            fatal "Internal: chosen memory cost exceeds the GRUB ceiling. Keyslots unchanged."
+        fi
         # Every active keyslot, one luksConvertKey each. cryptsetup prompts for
         # that slot's passphrase on the terminal; a slot whose passphrase (or
         # keyfile) isn't at hand can be skipped and converted later.
+        # --hash sha512: luksConvertKey rewrites the keyslot area and re-stamps
+        # its AF hash; without an explicit hash cryptsetup substitutes sha256.
         slots=$(cryptsetup luksDump "$dev" 2>/dev/null \
             | awk '/^[[:space:]]+[0-9]+: luks2/{s=$1; sub(":","",s); print s}')
         for slot in $slots; do
             echo ""
             log "  Re-costing keyslot $slot to argon2id $((LUKS_PBKDF_MEMORY / 1024)) MiB x ${LUKS_PBKDF_ITER} (enter that slot's passphrase)..."
             if cryptsetup luksConvertKey -S "$slot" --pbkdf argon2id \
+                    --hash sha512 \
                     --pbkdf-memory "$LUKS_PBKDF_MEMORY" \
                     --pbkdf-force-iterations "$LUKS_PBKDF_ITER" \
                     --pbkdf-parallel "$LUKS_PBKDF_PARALLEL" \
@@ -1124,7 +1284,7 @@ convert_luks1() {
             else
                 warn "  Keyslot $slot NOT converted (wrong passphrase / keyfile slot?)."
                 warn "  Convert it later with luks-tune.sh or:"
-                warn "    cryptsetup luksConvertKey -S $slot --pbkdf argon2id $dev"
+                warn "    cryptsetup luksConvertKey -S $slot --hash sha512 --pbkdf argon2id $dev"
             fi
         done
     fi
@@ -1180,6 +1340,18 @@ if blkid "$TARGET_ROOT" | grep -q 'TYPE="crypto_LUKS"'; then
         warn "The header is complete LUKS2 — the encryption itself FINISHED."
         echo ""
         pretty_luks_dump "$TARGET_ROOT"
+        # Recognise, never set up: if GRUB opens this volume, say so here so
+        # the tune option is taken with GRUB's ceiling in mind (luks-tune.sh
+        # re-checks and enforces it).
+        bt_grub_probe "$TARGET_ROOT"
+        if [ "$BT_GRUB_UNLOCKS" -eq 1 ]; then
+            echo ""
+            warn "GRUB itself unlocks this volume at boot (encrypted /boot):"
+            bt_grub_summary | sed 's/^/    /'
+            warn "  LinuxLocker never sets up or re-embeds an encrypted /boot. 'tune'"
+            warn "  applies GRUB's ceiling: 1 GiB argon2id, and unlock estimates"
+            warn "  multiplied by ${BT_GRUB_KDF_FACTOR} for GRUB's single-threaded KDF."
+        fi
         echo ""
         echo "  What next?"
         echo ""
@@ -1468,8 +1640,85 @@ if [ "$SYSTEM_MODE" -eq 1 ]; then
         && log "  /boot/firmware present — Raspberry Pi-style firmware partition."
 fi
 
+# ─── /boot inside the volume: recognised, never encrypted ───────────────────
+# With no separate /boot, the kernel, the initramfs and grub.cfg all live on
+# the root filesystem. Encrypting it means GRUB (or U-Boot's extlinux, which
+# cannot at all) has to open the LUKS volume before it can load anything.
+# That is an encrypted-/boot setup: GRUB runs the KDF itself, single-threaded
+# from the firmware's contiguous heap (1 GiB on x86 UEFI), its image has to be
+# re-embedded with the crypto modules by grub-install, and whether it can open
+# argon2id at all depends on the build. LinuxLocker does not offer any of
+# that. The fix is a separate, unencrypted /boot partition; then re-run.
+#
+# A volume that is ALREADY encrypted and unlocked by GRUB (config-only mode)
+# is recognised and its configuration is repaired; its KDF is left to
+# luks-tune.sh, which applies GRUB's ceiling.
+BOOT_IN_VOLUME=""
+if [ "$SYSTEM_MODE" -eq 1 ] && [ "$BOOT_IS_SEPARATE" -eq 0 ]; then
+    for bdir in "/mnt_temp/${SUBPATH}boot/grub2" "/mnt_temp/${SUBPATH}boot/grub" "/mnt_temp/${SUBPATH}boot/extlinux"; do
+        [ -d "$bdir" ] || continue
+        BOOT_IN_VOLUME="${bdir#/mnt_temp/"${SUBPATH}"}"
+        break
+    done
+fi
+if [ -n "$BOOT_IN_VOLUME" ] && [ "$DEPLOY_MODE" = "encrypt" ]; then
+    echo ""
+    err "╔══════════════════════════════════════════════════════════════╗"
+    err "║  /boot lives INSIDE the partition you selected               ║"
+    err "╚══════════════════════════════════════════════════════════════╝"
+    err "  Target fstab has no separate /boot, and /$BOOT_IN_VOLUME is on this"
+    err "  filesystem. Encrypting it would put the kernel, the initramfs and the"
+    err "  bootloader config inside the LUKS container, so the bootloader itself"
+    err "  would have to unlock the volume before it could load anything."
+    echo ""
+    echo "  That is an encrypted /boot, and LinuxLocker does not set one up:"
+    echo "    - GRUB runs the KDF single-threaded from the firmware heap, roughly"
+    echo "      ${BT_GRUB_KDF_FACTOR}x slower than the initramfs, with a 1 GiB argon2id ceiling on"
+    echo "      x86 UEFI (the memory must be one contiguous allocation);"
+    echo "    - the GRUB image must be re-embedded with the crypto modules by"
+    echo "      grub-install, and stock GRUB 2.12 has no argon2 code at all;"
+    echo "    - extlinux / U-Boot cannot read LUKS in any form."
+    echo ""
+    echo "  Give the system a separate, unencrypted /boot partition (1 GiB is"
+    echo "  plenty), move the contents of /boot there, add it to fstab, re-run"
+    echo "  grub-install / update-grub, and run LinuxLocker again."
+    echo "  Details: docs/BOOTLOADERS.md, 'Encrypted /boot'."
+    umount -R /mnt_temp 2>/dev/null || true
+    rmdir /mnt_temp 2>/dev/null || true
+    fatal "Refusing to encrypt a volume that holds /boot. Nothing was changed."
+elif [ -n "$BOOT_IN_VOLUME" ]; then
+    log "  /boot is inside this (already encrypted) volume — GRUB unlocks it at boot."
+    log "  Recognised: configuration is repaired; the KDF is not touched here."
+fi
+
 # ─── Same-Disk Sanity Check ──────────────────────────────────────────────────
 DISK_ROOT=$(lsblk -no PKNAME "$TARGET_ROOT" 2>/dev/null | head -n1)
+
+# An ESP or XBOOTLDR partition the target never lists in fstab is mounted at
+# boot by systemd-gpt-auto-generator, not by fstab. Nothing here can tell that
+# it belongs to this install, so it is not mounted into the chroot — and any
+# boot entries or UKIs on it are not updated. Say so now, while stopping is free.
+if [ "$SYSTEM_MODE" -eq 1 ] && [ -n "$DISK_ROOT" ] && [ -d /sys/firmware/efi ]; then
+    GPT_AUTO_MISSED=$(lsblk -rno NAME,PARTTYPE "/dev/$DISK_ROOT" 2>/dev/null | awk '
+        tolower($2)=="c12a7328-f81f-11d2-ba4b-00a0c93ec93b" { print "/dev/"$1" (EFI System Partition)" }
+        tolower($2)=="bc13c2ff-59e6-4262-a352-b275fd6f7172" { print "/dev/"$1" (XBOOTLDR)" }')
+    if [ -n "$GPT_AUTO_MISSED" ]; then
+        while IFS= read -r gp; do
+            [ -n "$gp" ] || continue
+            gp_dev=${gp%% *}
+            gp_real=$(readlink -f "$gp_dev" 2>/dev/null || echo "$gp_dev")
+            gp_listed=0
+            for gd in "${MNT_DEVS[@]+"${MNT_DEVS[@]}"}"; do
+                [ "$(readlink -f "$gd" 2>/dev/null)" = "$gp_real" ] && gp_listed=1
+            done
+            [ "$gp_listed" -eq 1 ] && continue
+            warn "  $gp is on this disk but the target's fstab never mounts it"
+            warn "  (systemd-gpt-auto-generator layout?). It will NOT be mounted into the"
+            warn "  chroot, so boot entries or UKIs on it are not updated. Add it to the"
+            warn "  target's fstab first if that is where this system boots from."
+        done <<< "$GPT_AUTO_MISSED"
+    fi
+fi
 for i in "${!MNT_MPS[@]}"; do
     d=$(lsblk -no PKNAME "${MNT_DEVS[$i]}" 2>/dev/null | head -n1)
     if [ -n "$d" ] && [ "$d" != "$DISK_ROOT" ]; then
@@ -1683,7 +1932,6 @@ fi
 # ─── KDF Profile Selection ──────────────────────────────────────────────────
 # Done here, just before the point of no return, so the estimates reflect the
 # machine as it will actually be. Skipped when parameters are pinned by env.
-MEM_TOTAL_KIB=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "$DEPLOY_MODE" = "config-only" ]; then
     KDF_PROFILE_NAME="(existing header — unchanged)"
     log "Config-only mode: the KDF is already fixed in the LUKS header; skipping profile menu."
@@ -1840,8 +2088,10 @@ if [ "$DRY_RUN" = "1" ]; then
         echo "  4. grow the filesystem to fill the container; mount the target (+boot/EFI) and bind-mount for chroot"
         echo "  5. offer a recovery keyslot; back up the LUKS header to /boot + $STATE_DIR/"
         echo "  6. edit on the target: /etc/crypttab, /etc/fstab, and whichever of"
-        echo "     /etc/default/grub, /etc/kernel/cmdline, /etc/mkinitcpio.conf,"
-        echo "     cmdline.txt, extlinux.conf the target actually uses (originals saved as *.pre-luks)"
+        echo "     /etc/default/grub (+ grub.d drop-ins), /etc/kernel/cmdline, cmdline.d,"
+        echo "     /etc/mkinitcpio.conf, cmdline.txt, extlinux.conf, systemd-boot entries,"
+        echo "     refind_linux.conf, limine.conf the target actually uses (originals"
+        echo "     saved as *.pre-luks); root=PARTUUID=/root=/dev/... become the mapper"
         if [ "${LUKS_KEEP_SPLASH:-0}" != "1" ]; then
             echo "     and strip 'rhgb quiet splash' so the passphrase prompt is visible"
             echo "     (post-encryption-setup.sh restores them; LUKS_KEEP_SPLASH=1 to skip)"
@@ -1875,39 +2125,6 @@ if [ "$DEPLOY_MODE" = "config-only" ]; then
 else
     read -p "Type 'ENCRYPT' to begin — there is no going back: " CONFIRM
     [ "$CONFIRM" = "ENCRYPT" ] || fatal "Aborted."
-
-    # ── Caps Lock trap ──────────────────────────────────────────────────────
-    # 'ENCRYPT' is all caps, so it is natural to switch Caps Lock on to type it
-    # and leave it on for the new passphrase a few seconds later. cryptsetup
-    # asks for that passphrase twice, but both entries would be inverted the
-    # same way, so its verification passes. The mistake surfaces at the boot
-    # prompt — Caps Lock off, nothing works, and the volume holds the only copy
-    # of the data. Ask the kernel's keyboard LED state and say so plainly.
-    if [ -z "${LUKS_PASSPHRASE_FILE:-}" ]; then
-        CAPS_STATE="unknown"
-        for _led in /sys/class/leds/*::capslock/brightness; do
-            [ -r "$_led" ] || continue
-            if [ "$(cat "$_led" 2>/dev/null || echo 0)" != "0" ]; then
-                CAPS_STATE="on"; break
-            fi
-            CAPS_STATE="off"
-        done
-        echo ""
-        case "$CAPS_STATE" in
-            on)
-                warn "CAPS LOCK IS ON — turn it off before the passphrase prompt."
-                warn "  You are about to set the passphrase this machine boots with."
-                warn "  cryptsetup asks for it twice, but both entries would be"
-                warn "  capitalised the same way, so it cannot catch this."
-                read -p "  Press Enter once Caps Lock is OFF (or leave it on deliberately): " _
-                ;;
-            *)
-                log "  If you switched Caps Lock on to type ENCRYPT, switch it off now —"
-                log "  cryptsetup's type-it-twice check cannot catch a passphrase that is"
-                log "  inverted both times, and the boot prompt is where you would find out."
-                ;;
-        esac
-    fi
 fi
 
 log "Starting LUKS deployment. Pre-encryption $ORIG_FSTYPE UUID: $ORIG_FS_UUID"
@@ -1962,9 +2179,50 @@ else
     log "  Hash: sha512  (AF splitter + LUKS2 volume-key digest; --hash sets both)"
     log "  Cipher: aes-xts-plain64  key-size=512 (AES-256-XTS)"
     log "  You will be prompted to set a passphrase (type it twice)."
-    log "  Check Caps Lock first — both entries would be inverted, so it verifies."
     log "  If interrupted, just re-run this script — it resumes automatically."
     echo ""
+
+    # ── Caps Lock gate ──────────────────────────────────────────────────────
+    # cryptsetup's next two prompts are, in this order:
+    #     Are you sure? (Type 'yes' in capital letters):
+    #     Enter passphrase for /dev/...:
+    # Reaching for Caps Lock to type that YES is the natural thing to do, and it
+    # stays on for the passphrase one prompt later. cryptsetup asks for the
+    # passphrase twice, but both entries are inverted the same way, so its
+    # type-it-twice check passes and the mistake only surfaces at the boot
+    # prompt — Caps Lock off, nothing works, and the volume holds the only copy
+    # of the data.
+    #
+    # So the last thing typed before cryptsetup runs is a LOWER CASE word. It
+    # cannot be entered with Caps Lock on, which makes accepting it the proof:
+    # no keyboard LED reading (unreliable over Bluetooth, absent on many
+    # laptops), and no warning issued minutes before the keystroke it is about.
+    if [ -z "${LUKS_PASSPHRASE_FILE:-}" ]; then
+        warn "  cryptsetup will now ask you to type YES in capital letters, and"
+        warn "  then for the passphrase this machine will boot with."
+        warn "  Hold SHIFT for that YES — do NOT use Caps Lock. Left on, it"
+        warn "  inverts the passphrase both times, so the type-it-twice check"
+        warn "  still passes and the boot prompt is where you would find out."
+        CAPS_TRIES=0
+        while :; do
+            if ! read -p "  Type 'yes' in lower case to confirm Caps Lock is off: " CAPS_OK; then
+                echo ""
+                fatal "Aborted (no input)."
+            fi
+            [ "$CAPS_OK" = "yes" ] && break
+            CAPS_TRIES=$((CAPS_TRIES + 1))
+            if [ "$CAPS_TRIES" -ge 5 ]; then
+                fatal "Aborted."
+            fi
+            if [ "$CAPS_OK" = "YES" ]; then
+                warn "  That arrived as 'YES' — Caps Lock is ON. Turn it off and"
+                warn "  type yes again in lower case."
+            else
+                warn "  Type yes (lower case) to continue, or Ctrl-C to abort."
+            fi
+        done
+        echo ""
+    fi
 
     # LUKS2 KDF pinned for fleet consistency — do NOT fall back to cryptsetup's
     # auto-benchmark defaults (they pick sha256 + variable, time-benchmarked memory).
@@ -2102,6 +2360,21 @@ else
         mount --bind /sys/firmware/efi/efivars /mnt/sys/firmware/efi/efivars 2>/dev/null || true
     fi
     log "  All mounts complete."
+
+    # An already-encrypted volume that GRUB itself opens (encrypted /boot) is
+    # recognised here, with everything mounted. Its configuration is repaired
+    # like any other; its GRUB image and KDF are never touched by this script.
+    if [ "$DEPLOY_MODE" = "config-only" ]; then
+        bt_grub_probe "$TARGET_ROOT" /mnt
+        if [ "$BT_GRUB_UNLOCKS" -eq 1 ]; then
+            echo ""
+            warn "GRUB itself unlocks this volume at boot (encrypted /boot):"
+            bt_grub_summary | sed 's/^/    /'
+            warn "  Configuration is repaired as usual. Nothing here re-embeds the GRUB"
+            warn "  image or changes the KDF — use luks-tune.sh for that, which applies"
+            warn "  GRUB's 1 GiB argon2id ceiling and its ${BT_GRUB_KDF_FACTOR}x unlock-time factor."
+        fi
+    fi
 fi
 
 # ─── Target boot machinery detection (initramfs generator + bootloader) ──────
@@ -2205,6 +2478,22 @@ case "$INITRAMFS_STYLE" in
 esac
 [ "$SYSTEM_MODE" -eq 1 ] && log "  Kernel LUKS arguments: ${LUKS_BOOT_ARGS:-'(none needed — crypttab-driven)'}"
 
+# Configure the command-line carrier layer (lib-boot.sh) for this target.
+# root=/resume= values that name the RAW partition — PARTUUID=, a device path
+# — must become the mapper; UUID=<inner fs uuid> is still correct and stays.
+CL_TARGET_PARTUUID=$(blkid -s PARTUUID -o value "$TARGET_ROOT" 2>/dev/null || echo "")
+# (each is read by the lib-boot.sh functions, not here)
+# shellcheck disable=SC2034
+CL_MAPPER="$LUKS_NAME"
+# shellcheck disable=SC2034
+CL_LUKS_ARGS="$LUKS_BOOT_ARGS"
+# shellcheck disable=SC2034
+CL_TARGET_REAL="$TARGET_ROOT_REAL"
+# shellcheck disable=SC2034
+CL_LUKS_UUID="$LUKS_UUID"
+# shellcheck disable=SC2034
+CL_FS_UUID="$ORIG_FS_UUID"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 5: Recovery Key + LUKS Header Backup
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2270,7 +2559,11 @@ case "$RK_CHOICE" in
             # later luksDump audit.
             log "  Enrolling recovery key (enter the volume passphrase when asked)..."
             log "  Recovery keyslot KDF: argon2id $((LUKS_PBKDF_MEMORY / 1024)) MiB x ${LUKS_PBKDF_ITER} (current profile — other slots may differ)"
+            # --hash sha512: a new keyslot gets its own AF hash, and without an
+            # explicit value cryptsetup stamps its compiled-in sha256 — the
+            # same silent downgrade luks-tune.sh had, verified on cryptsetup 2.8.
             if cryptsetup luksAddKey "${CRYPT_PASS_ARGS[@]}" "$TARGET_ROOT" "$RK_FILE" \
+                   --hash sha512 \
                    --pbkdf argon2id \
                    --pbkdf-memory "$LUKS_PBKDF_MEMORY" \
                    --pbkdf-parallel "$LUKS_PBKDF_PARALLEL" \
@@ -2306,7 +2599,9 @@ esac
 # copy from a previous run first (the current header is authoritative).
 HDR_TMP="$STATE_DIR/luks-header-backup.img"
 rm -f "$HDR_TMP"
-cryptsetup luksHeaderBackup "$TARGET_ROOT" --header-backup-file "$HDR_TMP"
+# umask 077 in a subshell: luksHeaderBackup creates the file itself and refuses
+# to overwrite, so the mode must be right at creation rather than fixed after.
+( umask 077; cryptsetup luksHeaderBackup "$TARGET_ROOT" --header-backup-file "$HDR_TMP" )
 harden_path 0400 "$HDR_TMP"
 log "  Header backup: $HDR_TMP (deployment drive)"
 if [ "$SYSTEM_MODE" -eq 1 ]; then
@@ -2366,6 +2661,14 @@ fi
 echo ""
 log "[6/8] Updating system configuration..."
 
+# Nothing in this stage aborts the run. Once the volume is encrypted, dying
+# half-way through the configuration leaves the operator with a machine whose
+# state has to be reconstructed from a log; finishing every step and letting
+# the verification gate list what is wrong does not. Each problem here is
+# recorded, echoed, and counted into the gate's total.
+CONFIG_ERRORS=0
+cfg_fail() { err "$@"; CONFIG_ERRORS=$((CONFIG_ERRORS + 1)); }
+
 # ─── 6a: crypttab ────────────────────────────────────────────────────────────
 # initramfs-tools only includes crypttab entries carrying the 'initramfs'
 # option (or ones it can prove are needed for the root — be explicit instead
@@ -2408,15 +2711,15 @@ else
     warn "  Neither UUID=$ORIG_FS_UUID nor PARTUUID found in fstab!"
     echo "  Current root-looking entries:"
     grep -E "^[^#].*[[:space:]]/[[:space:]]" /mnt/etc/fstab || echo "  (none)"
-    fatal "  fstab update failed — cannot find the original root entry."
+    cfg_fail "  fstab update failed — cannot find the original root entry (V2 will report it)."
 fi
 
 # Verify fstab was updated correctly
 if ! grep -q "$LUKS_NAME" /mnt/etc/fstab; then
-    fatal "  fstab does not reference $LUKS_NAME after update!"
+    cfg_fail "  fstab does not reference $LUKS_NAME after update!"
 fi
 if grep -q "UUID=$ORIG_FS_UUID" /mnt/etc/fstab; then
-    fatal "  fstab still contains old UUID=$ORIG_FS_UUID after replacement!"
+    cfg_fail "  fstab still contains old UUID=$ORIG_FS_UUID after replacement!"
 fi
 echo "  --- /etc/fstab ---"
 cat /mnt/etc/fstab
@@ -2441,11 +2744,11 @@ if [ -f /mnt/etc/default/grub ]; then
     log "  Updating /etc/default/grub..."
     cp /mnt/etc/default/grub /mnt/etc/default/grub.pre-luks
 
-    # GRUB_ENABLE_CRYPTODISK=y (allows GRUB to access encrypted partitions if needed)
-    if ! grep -q "^GRUB_ENABLE_CRYPTODISK=y" /mnt/etc/default/grub; then
-        echo "GRUB_ENABLE_CRYPTODISK=y" >> /mnt/etc/default/grub
-        log "    Added GRUB_ENABLE_CRYPTODISK=y"
-    fi
+    # GRUB_ENABLE_CRYPTODISK is deliberately NOT written. It only matters when
+    # GRUB itself has to open a LUKS volume to reach /boot, and LinuxLocker
+    # never produces that layout (a /boot inside the volume is refused above).
+    # A target that already has it — an existing encrypted /boot in
+    # config-only mode — keeps it untouched.
 
     # WHICH variable carries the kernel command line is distro-dependent, so
     # never assume GRUB_CMDLINE_LINUX is present:
@@ -2475,48 +2778,155 @@ if [ -f /mnt/etc/default/grub ]; then
                 \"*\") CURRENT_CMDLINE=${CURRENT_CMDLINE#\"}; CURRENT_CMDLINE=${CURRENT_CMDLINE%\"} ;;
                 \'*\') CURRENT_CMDLINE=${CURRENT_CMDLINE#\'}; CURRENT_CMDLINE=${CURRENT_CMDLINE%\'} ;;
             esac
-            grub_cmdline_set GRUB_CMDLINE_LINUX \
-                "$LUKS_BOOT_ARGS${CURRENT_CMDLINE:+ $CURRENT_CMDLINE}" \
-                || fatal "  Could not rewrite GRUB_CMDLINE_LINUX in /etc/default/grub."
-            log "    Added $LUKS_BOOT_ARGS to GRUB_CMDLINE_LINUX"
+            if grub_cmdline_set GRUB_CMDLINE_LINUX \
+                "$LUKS_BOOT_ARGS${CURRENT_CMDLINE:+ $CURRENT_CMDLINE}"; then
+                log "    Added $LUKS_BOOT_ARGS to GRUB_CMDLINE_LINUX"
+            else
+                cfg_fail "  Could not rewrite GRUB_CMDLINE_LINUX in /etc/default/grub (V3 will report it)."
+            fi
         else
             warn "  No GRUB_CMDLINE_LINUX line in /etc/default/grub — adding one."
             echo "GRUB_CMDLINE_LINUX=\"$LUKS_BOOT_ARGS\"" >> /mnt/etc/default/grub
             log "    Added $LUKS_BOOT_ARGS to GRUB_CMDLINE_LINUX"
         fi
 
-        # Do not leave this stage without the unlock arguments actually on disk.
+        # The unlock arguments must actually be on disk now.
         if ! grep -qF "$LUKS_BOOT_ARGS" /mnt/etc/default/grub; then
-            fatal "  /etc/default/grub still has no '$LUKS_BOOT_ARGS' after update!"
+            cfg_fail "  /etc/default/grub still has no '$LUKS_BOOT_ARGS' after update!"
         fi
     else
         log "    ($INITRAMFS_STYLE needs no kernel LUKS arguments — crypttab drives the unlock)"
     fi
+
+    # A root= or resume= inside GRUB_CMDLINE_LINUX that names the raw partition
+    # (PARTUUID=, /dev/...) must become the mapper. Arguments were added above.
+    CL_ADD_ARGS=0 cl_patch_file grubvar /mnt/etc/default/grub 'GRUB_CMDLINE_LINUX' || true
+    [ "$CL_CHANGED" -eq 1 ] && log "    Rewrote a root=/resume= in GRUB_CMDLINE_LINUX to the mapper"
+
+    # /etc/default/grub.d/*.cfg: grub-mkconfig sources these AFTER the main
+    # file, so a drop-in that defines GRUB_CMDLINE_LINUX silently replaces what
+    # was just written (Ubuntu ships several). Patch every such drop-in too.
+    for gd in /mnt/etc/default/grub.d/*.cfg; do
+        [ -f "$gd" ] || continue
+        cl_grub_var_defined "$gd" GRUB_CMDLINE_LINUX || continue
+        [ -f "$gd.pre-luks" ] || cp "$gd" "$gd.pre-luks"
+        if cl_patch_file grubvar "$gd" 'GRUB_CMDLINE_LINUX'; then
+            log "    ${gd#/mnt}: GRUB_CMDLINE_LINUX drop-in updated"
+        else
+            cfg_fail "  Could not rewrite GRUB_CMDLINE_LINUX in ${gd#/mnt} (V3 will report it)."
+        fi
+    done
+
+    # GRUB_FORCE_PARTUUID (Ubuntu cloud images, /etc/default/grub.d/40-force-partuuid.cfg)
+    # makes grub-mkconfig write root=PARTUUID=<raw partition> and try an
+    # initrd-less boot first. Both point straight past the mapper. Disable it.
+    for gd in /mnt/etc/default/grub /mnt/etc/default/grub.d/*.cfg; do
+        [ -f "$gd" ] || continue
+        grep -qE '^[[:space:]]*GRUB_FORCE_PARTUUID=' "$gd" || continue
+        [ -f "$gd.pre-luks" ] || cp "$gd" "$gd.pre-luks"
+        sed -i -E 's|^([[:space:]]*GRUB_FORCE_PARTUUID=)|# LinuxLocker: disabled, root is a LUKS mapper now — \1|' "$gd"
+        warn "    ${gd#/mnt}: GRUB_FORCE_PARTUUID disabled (it would boot root=PARTUUID past the mapper)"
+    done
+
+    # Do not leave this stage unless the value grub-mkconfig will actually use
+    # — after every drop-in — carries the unlock arguments.
+    if [ -n "$LUKS_BOOT_ARGS" ]; then
+        GRUB_EFFECTIVE=$(cl_grub_effective /mnt GRUB_CMDLINE_LINUX || true)
+        if ! cl_has_all_args "$GRUB_EFFECTIVE"; then
+            cfg_fail "  Effective GRUB_CMDLINE_LINUX (after /etc/default/grub.d/*.cfg) lacks the LUKS arguments: '$GRUB_EFFECTIVE'"
+            err "  A drop-in in /etc/default/grub.d overrides them — the gate will refuse the reboot until it is fixed."
+        fi
+    fi
+
+    # Hand-written menu entries carry their own root= and are never regenerated.
+    for gc in /mnt/etc/grub.d/40_custom /mnt/boot/grub2/custom.cfg /mnt/boot/grub/custom.cfg; do
+        [ -f "$gc" ] || continue
+        if grep -qE '^[[:space:]]*(linux|linuxefi)[[:space:]]' "$gc"; then
+            if grep -E '^[[:space:]]*(linux|linuxefi)[[:space:]]' "$gc" \
+                 | grep -qE "PARTUUID=${CL_TARGET_PARTUUID:-__none__}|$(basename "$TARGET_ROOT")|UUID=$ORIG_FS_UUID"; then
+                warn "    ${gc#/mnt} has a hand-written 'linux' line naming this partition —"
+                warn "    it is not regenerated; edit its root= and add '${LUKS_BOOT_ARGS:-(nothing)}' yourself."
+            fi
+        fi
+    done
+
     echo "  --- /etc/default/grub ---"
     cat /mnt/etc/default/grub
 else
     log "  No /etc/default/grub on target (not a GRUB system) — skipping."
 fi
 
-# ─── 6d: /etc/kernel/cmdline (BLS source of truth for kernel-install) ────────
+# ─── 6d: /etc/kernel/cmdline and /etc/cmdline.d ─────────────────────────────
+# /etc/kernel/cmdline is what kernel-install, dracut --uki-file, ukify and
+# mkinitcpio bake into new boot entries and UKIs. mkinitcpio ALSO concatenates
+# /etc/cmdline.d/*.conf after it. And every one of those tools falls back to
+# /proc/cmdline when neither exists — which, from a chroot on a live USB, is
+# the LIVE USB's command line. So on a UKI target the file must exist before
+# step 7f rebuilds anything.
+CMDLINE_D_HAS_CONFS=0
+for cd_conf in /mnt/etc/cmdline.d/*.conf; do
+    [ -f "$cd_conf" ] && CMDLINE_D_HAS_CONFS=1 && break
+done
+
+# Only the targets whose tooling reads this file get one created: UKI
+# targets (every rebuild backend reads it) and dracut + BLS (kernel-install
+# copies it into new entries). A systemd-boot Type #1 box that never had it
+# keeps not having it — its entries are patched directly in stage 6h.
+NEEDS_KERNEL_CMDLINE=0
+if [ "$UKI_ACTIVE" -eq 1 ] || { [ "$INITRAMFS_STYLE" = "dracut" ] && [ "$HAS_BLS" -eq 1 ]; }; then
+    NEEDS_KERNEL_CMDLINE=1
+fi
+if [ ! -f /mnt/etc/kernel/cmdline ] && [ "$CMDLINE_D_HAS_CONFS" -eq 0 ] && [ "$NEEDS_KERNEL_CMDLINE" -eq 1 ]; then
+    SEED_CMDLINE=""
+    if [ "$UKI_ACTIVE" -eq 1 ] && [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "${#UKI_PATHS[@]}" -gt 0 ]; then
+        # The line the machine actually boots with today, out of its UKI.
+        SEED_CMDLINE=$(uki_cmdline_of "${UKI_PATHS[0]}" 2>/dev/null || true)
+        [ -n "$SEED_CMDLINE" ] && log "  Seeding /etc/kernel/cmdline from $(basename "${UKI_PATHS[0]}")'s .cmdline"
+    fi
+    if [ -z "$SEED_CMDLINE" ]; then
+        for bls_seed in /mnt/boot/loader/entries/*.conf /mnt/efi/loader/entries/*.conf /mnt/boot/efi/loader/entries/*.conf; do
+            [ -f "$bls_seed" ] || continue
+            basename "$bls_seed" | grep -q rescue && continue
+            SEED_CMDLINE=$(sed -n 's/^options[[:space:]]\+//p' "$bls_seed" | head -1)
+            [ -n "$SEED_CMDLINE" ] && { log "  Seeding /etc/kernel/cmdline from $(basename "$bls_seed")"; break; }
+        done
+    fi
+    if [ -z "$SEED_CMDLINE" ]; then
+        ROOTFLAGS=""
+        [ "$IS_BTRFS" -eq 1 ] && [ -n "$ROOT_SUBVOL" ] && ROOTFLAGS=" rootflags=subvol=$ROOT_SUBVOL"
+        SEED_CMDLINE="root=UUID=$ORIG_FS_UUID ro${ROOTFLAGS}"
+        log "  Seeding /etc/kernel/cmdline from the inner filesystem UUID"
+    fi
+    if [ -n "$SEED_CMDLINE" ]; then
+        warn "  /etc/kernel/cmdline not found — creating it (without it, a rebuild would bake in the LIVE USB's /proc/cmdline)."
+        mkdir -p /mnt/etc/kernel
+        printf '%s\n' "$SEED_CMDLINE" > /mnt/etc/kernel/cmdline
+    fi
+fi
+
 if [ -f /mnt/etc/kernel/cmdline ]; then
     log "  Updating /etc/kernel/cmdline..."
-    cp /mnt/etc/kernel/cmdline /mnt/etc/kernel/cmdline.pre-luks
-    KERN_CMDLINE=$(tr '\n' ' ' < /mnt/etc/kernel/cmdline | sed 's/[[:space:]]*$//')
-    if [ -n "$LUKS_BOOT_ARGS" ] && ! echo "$KERN_CMDLINE" | grep -qF "$LUKS_BOOT_ARGS"; then
-        echo "$KERN_CMDLINE $LUKS_BOOT_ARGS" > /mnt/etc/kernel/cmdline
-        log "    Added LUKS params to /etc/kernel/cmdline"
+    [ -f /mnt/etc/kernel/cmdline.pre-luks ] || cp /mnt/etc/kernel/cmdline /mnt/etc/kernel/cmdline.pre-luks
+    cl_patch_file cmdline /mnt/etc/kernel/cmdline || cfg_fail "  Could not rewrite /etc/kernel/cmdline (V14 will report it)."
+    [ "$CL_CHANGED" -eq 1 ] && log "    root=/resume= and LUKS arguments applied"
+    echo "  --- /etc/kernel/cmdline ---"
+    cat /mnt/etc/kernel/cmdline
+fi
+
+if [ "$CMDLINE_D_HAS_CONFS" -eq 1 ]; then
+    log "  Updating /etc/cmdline.d/*.conf (mkinitcpio concatenates these)..."
+    for cd_conf in /mnt/etc/cmdline.d/*.conf; do
+        [ -f "$cd_conf" ] || continue
+        [ -f "$cd_conf.pre-luks" ] || cp "$cd_conf" "$cd_conf.pre-luks"
+        cl_patch_file dropin "$cd_conf" || cfg_fail "  Could not rewrite ${cd_conf#/mnt} (V14 will report it)."
+        [ "$CL_CHANGED" -eq 1 ] && log "    ${cd_conf#/mnt}: root=/resume= rewritten to the mapper"
+    done
+    # The unlock arguments live in ONE fragment, not in every file, and only
+    # when /etc/kernel/cmdline is not already carrying them.
+    if [ -n "$LUKS_BOOT_ARGS" ] && [ ! -f /mnt/etc/kernel/cmdline ]; then
+        printf '%s\n' "$LUKS_BOOT_ARGS" > /mnt/etc/cmdline.d/90-linuxlocker.conf
+        log "    Wrote /etc/cmdline.d/90-linuxlocker.conf: $LUKS_BOOT_ARGS"
     fi
-    echo "  --- /etc/kernel/cmdline ---"
-    cat /mnt/etc/kernel/cmdline
-elif [ "$INITRAMFS_STYLE" = "dracut" ] && [ "$HAS_BLS" -eq 1 ]; then
-    warn "  /etc/kernel/cmdline not found on a BLS system — creating it."
-    ROOTFLAGS=""
-    [ "$IS_BTRFS" -eq 1 ] && [ -n "$ROOT_SUBVOL" ] && ROOTFLAGS=" rootflags=subvol=$ROOT_SUBVOL"
-    echo "root=UUID=$ORIG_FS_UUID ro${ROOTFLAGS} $LUKS_BOOT_ARGS" \
-        > /mnt/etc/kernel/cmdline
-    echo "  --- /etc/kernel/cmdline ---"
-    cat /mnt/etc/kernel/cmdline
 fi
 
 # ─── 6e: initramfs generator configuration ───────────────────────────────────
@@ -2551,7 +2961,7 @@ DRACUT_CONF
             if grep -Eq "^HOOKS=.*[( ]${WANT_HOOK}[ )]" /mnt/etc/mkinitcpio.conf; then
                 log "    Inserted '$WANT_HOOK' before 'filesystems' in HOOKS."
             else
-                fatal "Could not insert '$WANT_HOOK' into mkinitcpio HOOKS — edit /etc/mkinitcpio.conf on the target and re-run."
+                cfg_fail "Could not insert '$WANT_HOOK' into mkinitcpio HOOKS (no 'filesystems' hook to anchor on?) — edit /etc/mkinitcpio.conf on the target; V9 will report it."
             fi
         fi
         grep '^HOOKS=' /mnt/etc/mkinitcpio.conf | sed 's/^/    /'
@@ -2570,12 +2980,12 @@ DRACUT_CONF
                    && [ -e /mnt/usr/share/initramfs-tools/hooks/cryptroot ]; then
                     log "    cryptsetup-initramfs installed."
                 else
-                    fatal "Could not install cryptsetup-initramfs in the chroot. Get the
-     target online (or pre-install the package) and re-run this script —
-     it will land in configuration-only mode and finish the job."
+                    cfg_fail "Could not install cryptsetup-initramfs in the chroot. Get the target
+     online (or pre-install the package) and re-run this script — it lands in
+     configuration-only mode and finishes the job. V9 will report this."
                 fi
             else
-                fatal "cryptsetup-initramfs missing and no apt-get in the chroot."
+                cfg_fail "cryptsetup-initramfs missing and no apt-get in the chroot (V9 will report it)."
             fi
         fi
         ;;
@@ -2588,16 +2998,15 @@ esac
 # along. Single line, by firmware requirement.
 if [ -n "$RPI_CMDLINE" ]; then
     log "  Updating ${RPI_CMDLINE#/mnt}..."
-    cp "$RPI_CMDLINE" "${RPI_CMDLINE}.pre-luks"
-    CMDLINE=$(head -1 "$RPI_CMDLINE" | tr -d '\n')
-    NEW_CMDLINE=$(echo "$CMDLINE" | sed -E "s|root=[^[:space:]]+|root=/dev/mapper/$LUKS_NAME|")
-    if ! echo "$NEW_CMDLINE" | grep -q "root=/dev/mapper/$LUKS_NAME"; then
-        NEW_CMDLINE="root=/dev/mapper/$LUKS_NAME $NEW_CMDLINE"
+    [ -f "${RPI_CMDLINE}.pre-luks" ] || cp "$RPI_CMDLINE" "${RPI_CMDLINE}.pre-luks"
+    cl_patch_file cmdline "$RPI_CMDLINE" || cfg_fail "  Could not rewrite ${RPI_CMDLINE#/mnt} (V6 will report it)."
+    # cmdline.txt always names the partition (PARTUUID= on Raspberry Pi OS):
+    # if root= still is not the mapper, nothing above recognised it.
+    if ! grep -q "root=/dev/mapper/$LUKS_NAME" "$RPI_CMDLINE"; then
+        sed -i -E "s|root=[^[:space:]]+|root=/dev/mapper/$LUKS_NAME|" "$RPI_CMDLINE"
+        grep -q "root=/dev/mapper/$LUKS_NAME" "$RPI_CMDLINE" \
+            || sed -i "1s|^|root=/dev/mapper/$LUKS_NAME |" "$RPI_CMDLINE"
     fi
-    if [ -n "$LUKS_BOOT_ARGS" ] && ! echo "$NEW_CMDLINE" | grep -qF "$LUKS_BOOT_ARGS"; then
-        NEW_CMDLINE="$NEW_CMDLINE $LUKS_BOOT_ARGS"
-    fi
-    printf '%s\n' "$NEW_CMDLINE" > "$RPI_CMDLINE"
     log "    root= now points at /dev/mapper/$LUKS_NAME"
     echo "  --- ${RPI_CMDLINE#/mnt} ---"
     cat "$RPI_CMDLINE"
@@ -2614,13 +3023,42 @@ fi
 # ─── 6g: extlinux.conf (U-Boot distro-boot on many ARM boards) ───────────────
 if [ -n "$EXTLINUX_CONF" ]; then
     log "  Updating ${EXTLINUX_CONF#/mnt}..."
-    cp "$EXTLINUX_CONF" "${EXTLINUX_CONF}.pre-luks"
-    sed -i -E "s|(^[[:space:]]*(APPEND|append)[[:space:]].*)root=[^[:space:]]+|\1root=/dev/mapper/$LUKS_NAME|" "$EXTLINUX_CONF"
-    if [ -n "$LUKS_BOOT_ARGS" ] && ! grep -qF "$LUKS_BOOT_ARGS" "$EXTLINUX_CONF"; then
-        sed -i -E "s|^([[:space:]]*(APPEND\|append)[[:space:]].*)\$|\1 $LUKS_BOOT_ARGS|" "$EXTLINUX_CONF"
+    [ -f "${EXTLINUX_CONF}.pre-luks" ] || cp "$EXTLINUX_CONF" "${EXTLINUX_CONF}.pre-luks"
+    cl_patch_file extlinux "$EXTLINUX_CONF" || cfg_fail "  Could not rewrite ${EXTLINUX_CONF#/mnt} (V6 will report it)."
+    if ! grep -q "root=/dev/mapper/$LUKS_NAME" "$EXTLINUX_CONF"; then
+        # An APPEND whose root= was not recognised as this partition (a
+        # by-path link, a label): rewrite root= on every APPEND line outright.
+        sed -i -E "s#(^[[:space:]]*[Aa][Pp][Pp][Ee][Nn][Dd][[:space:]].*)root=[^[:space:]]+#\1root=/dev/mapper/$LUKS_NAME#" "$EXTLINUX_CONF"
     fi
     grep -inE '^[[:space:]]*(APPEND|append)' "$EXTLINUX_CONF" | sed 's/^/    /' || true
 fi
+
+# ─── 6h: every other command-line carrier ────────────────────────────────────
+# Type #1 entries under /efi or /boot/efi (systemd-boot with the ESP there —
+# /boot/loader/entries is handled by grubby/direct patch in step 7c, but its
+# root= is fixed here too), rEFInd's refind_linux.conf, Limine's limine.conf
+# and its /etc/default/limine source. Each gets root=/resume= pointed at the
+# mapper and the unlock arguments appended; each original is kept as
+# *.pre-luks. A stale carrier for a bootloader no longer in use is patched
+# too — harmless, and it cannot be told apart from the live one from here.
+while IFS=$'\t' read -r ckind cpath; do
+    [ -n "$ckind" ] || continue
+    case "$ckind" in
+        cmdline|dropin|extlinux|grubd) continue ;;     # handled in 6c/6d/6f/6g
+        bls|refind|limine|limine-default) ;;
+        *) continue ;;
+    esac
+    [ -f "$cpath.pre-luks" ] || cp "$cpath" "$cpath.pre-luks" 2>/dev/null || true
+    case "$ckind" in
+        bls)            cl_patch_file bls     "$cpath" ;;
+        refind)         cl_patch_file refind  "$cpath" ;;
+        limine)         cl_patch_file limine  "$cpath" ;;
+        limine-default) cl_patch_file grubvar "$cpath" 'KERNEL_CMDLINE(\[[^]]*\])?' ;;
+    esac || { cfg_fail "  Could not rewrite ${cpath#/mnt} ($ckind) — V14 will report it."; continue; }
+    if [ "$CL_CHANGED" -eq 1 ]; then
+        log "  ${cpath#/mnt} ($ckind): root=/resume= → mapper${LUKS_BOOT_ARGS:+, LUKS arguments added}"
+    fi
+done < <(cl_find_carriers /mnt)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 7: Rebuild Initramfs + Update Boot Entries + Rebuild GRUB (in chroot)
@@ -2629,6 +3067,7 @@ echo ""
 log "[7/8] Rebuilding initramfs, boot entries, and bootloader config..."
 
 # Pass required variables into the chroot via a sourced env file
+mkdir -p /mnt/tmp
 cat > /mnt/tmp/.luks-deploy-env <<EOF
 LUKS_UUID="$LUKS_UUID"
 LUKS_NAME="$LUKS_NAME"
@@ -2647,6 +3086,8 @@ LUKS_SB_KEY="${UKI_SB_KEY:-}"
 LUKS_SB_CERT="${UKI_SB_CERT:-}"
 LUKS_SB_STATE="${UKI_SB_STATE:-unknown}"
 LUKS_SKIP_UKI_SIGN="${LUKS_SKIP_UKI_SIGN:-0}"
+CL_TARGET_REAL="$TARGET_ROOT_REAL"
+CL_TARGET_PARTUUID="$CL_TARGET_PARTUUID"
 EOF
 
 # lib-uki.sh has to run INSIDE the chroot for 7f/7g: the regeneration tools are
@@ -2655,6 +3096,9 @@ EOF
 if [ "$LL_HAVE_UKI_LIB" -eq 1 ]; then
     cp "$SCRIPT_DIR/lib-uki.sh" /mnt/tmp/.luks-lib-uki.sh 2>/dev/null || true
 fi
+# lib-boot.sh does the splash strip inside the chroot, across every carrier.
+cp "$SCRIPT_DIR/lib-boot.sh" /mnt/tmp/.luks-lib-boot.sh 2>/dev/null \
+    || warn "  Could not copy lib-boot.sh into the chroot — the splash will not be stripped."
 
 CHROOT_RC=0
 chroot /mnt /bin/bash <<'CHROOT_SCRIPT' || CHROOT_RC=$?
@@ -2835,7 +3279,14 @@ fi
 if [ -n "$LUKS_BOOT_ARGS" ] && [ -d /boot/loader/entries ]; then
     echo ""
     echo "[CHROOT] Updating BLS boot entries..."
-    if command -v grubby &>/dev/null; then
+    BLS_MISSING=0
+    for entry in /boot/loader/entries/*.conf; do
+        [ -f "$entry" ] || continue
+        grep -qF "$LUKS_BOOT_ARGS" "$entry" || BLS_MISSING=$((BLS_MISSING + 1))
+    done
+    if [ "$BLS_MISSING" -eq 0 ]; then
+        echo "[CHROOT] Every BLS entry already carries the LUKS arguments (stage 6h)."
+    elif command -v grubby &>/dev/null; then
         echo "[CHROOT] Using grubby to add: $LUKS_BOOT_ARGS"
         if grubby --update-kernel=ALL --args="$LUKS_BOOT_ARGS" 2>&1; then
             echo "[CHROOT] grubby: updated ALL kernel entries."
@@ -2933,18 +3384,29 @@ fi
 # With the splash active, the first-boot LUKS prompt hides behind boot
 # graphics/text and looks like a hang. Distros differ: Fedora uses
 # 'rhgb quiet', Debian/Ubuntu/Raspberry Pi OS use 'quiet splash'. Strip
-# whichever tokens are actually present; a marker file tells
-# post-encryption-setup.sh which ones to restore after the first encrypted
-# boot. Opt out with LUKS_KEEP_SPLASH=1.
+# whichever tokens are actually present, from EVERY carrier lib-boot.sh knows
+# (GRUB defaults and their drop-ins, /etc/kernel/cmdline, cmdline.d, BLS and
+# systemd-boot entries wherever the ESP is, cmdline.txt, extlinux, rEFInd,
+# Limine); a marker file tells post-encryption-setup.sh which ones to restore
+# after the first encrypted boot. Opt out with LUKS_KEEP_SPLASH=1.
 echo ""
 if [ "${LUKS_KEEP_SPLASH:-0}" = "1" ]; then
     echo "[CHROOT] LUKS_KEEP_SPLASH=1 — leaving splash boot arguments in place."
+elif [ ! -f /tmp/.luks-lib-boot.sh ]; then
+    echo "[CHROOT] WARN: lib-boot.sh missing in the chroot — splash left in place."
 else
+    # shellcheck source=/dev/null
+    . /tmp/.luks-lib-boot.sh
+    CL_MAPPER="$LUKS_NAME"; CL_LUKS_ARGS=""; CL_ADD_ARGS=0; CL_FIX_ROOT=0
+    SPLASH_FILES="/etc/default/grub"
+    while IFS=$'\t' read -r ckind cpath; do
+        [ -n "$cpath" ] && SPLASH_FILES="$SPLASH_FILES $cpath"
+    done < <(cl_find_carriers "")
     # Which of the candidate tokens does this system actually use?
     FOUND_TOKENS=""
     for tok in rhgb quiet splash; do
-        for f in /etc/default/grub /etc/kernel/cmdline "$RPI_CMDLINE" /boot/loader/entries/*.conf; do
-            [ -n "$f" ] && [ -f "$f" ] || continue
+        for f in $SPLASH_FILES; do
+            [ -f "$f" ] || continue
             if grep -qw "$tok" "$f" 2>/dev/null; then
                 FOUND_TOKENS="${FOUND_TOKENS:+$FOUND_TOKENS }$tok"
                 break
@@ -2955,41 +3417,30 @@ else
         echo "[CHROOT] No splash tokens (rhgb/quiet/splash) found — nothing to strip."
     else
         echo "[CHROOT] Stripping '$FOUND_TOKENS' from boot args (post-encryption-setup.sh restores them)..."
-        strip_splash_tokens() {
-            # $1 = file, $2 = sed address ('' = whole line applies)
-            # Three boundary cases, each swept twice because adjacent tokens
-            # ('rhgb quiet') need a second pass (sed resumes after the match):
-            #   1. token preceded by whitespace (mid/end of line): the token and its
-            #      leading space are dropped, boundary \2 (space, quote, EOL) kept
-            #   2. token at the very start of the line (bare cmdline files)
-            #   3. token right after an opening quote (GRUB_CMDLINE_LINUX="quiet ...")
-            sed -i -E "
-                $2 s/[[:space:]]+(rhgb|quiet|splash)([[:space:]]+|\"|\$)/\\2/g
-                $2 s/[[:space:]]+(rhgb|quiet|splash)([[:space:]]+|\"|\$)/\\2/g
-                $2 s/^(rhgb|quiet|splash)([[:space:]]+|\$)//
-                $2 s/^(rhgb|quiet|splash)([[:space:]]+|\$)//
-                $2 s/(=\")(rhgb|quiet|splash)[[:space:]]+/\\1/
-                $2 s/(=\")(rhgb|quiet|splash)[[:space:]]+/\\1/
-                $2 s/(=\")(rhgb|quiet|splash)(\")/\\1\\3/
-                $2 s/[[:space:]]+\$//
-            " "$1"
-        }
+        CL_STRIP_TOKENS="$FOUND_TOKENS"
         if command -v grubby &>/dev/null && [ -d /boot/loader/entries ]; then
             grubby --update-kernel=ALL --remove-args="$FOUND_TOKENS" 2>&1 \
                 || echo "[CHROOT] WARN: grubby --remove-args failed (BLS entries keep the splash)."
-        elif [ -d /boot/loader/entries ]; then
-            for entry in /boot/loader/entries/*.conf; do
-                [ -f "$entry" ] || continue
-                strip_splash_tokens "$entry" '/^options /'
-            done
         fi
-        [ -f /etc/kernel/cmdline ]  && strip_splash_tokens /etc/kernel/cmdline ''
-        [ -f /etc/default/grub ]    && strip_splash_tokens /etc/default/grub '/^GRUB_CMDLINE_LINUX/'
-        [ -n "$RPI_CMDLINE" ] && [ -f "$RPI_CMDLINE" ] && strip_splash_tokens "$RPI_CMDLINE" ''
+        [ -f /etc/default/grub ] && cl_patch_file grubvar /etc/default/grub 'GRUB_CMDLINE_LINUX(_DEFAULT)?'
+        while IFS=$'\t' read -r ckind cpath; do
+            [ -n "$cpath" ] || continue
+            case "$ckind" in
+                cmdline)        cl_patch_file cmdline  "$cpath" ;;
+                dropin)         cl_patch_file dropin   "$cpath" ;;
+                bls)            cl_patch_file bls      "$cpath" ;;
+                extlinux)       cl_patch_file extlinux "$cpath" ;;
+                refind)         cl_patch_file refind   "$cpath" ;;
+                limine)         cl_patch_file limine   "$cpath" ;;
+                limine-default) cl_patch_file grubvar  "$cpath" 'KERNEL_CMDLINE(\[[^]]*\])?' ;;
+                grubd)          cl_patch_file grubvar  "$cpath" 'GRUB_CMDLINE_LINUX(_DEFAULT)?' ;;
+            esac || echo "[CHROOT] WARN: could not strip the splash from $cpath"
+        done < <(cl_find_carriers "")
         mkdir -p /var/lib/linuxlocker
         echo "$FOUND_TOKENS" > /var/lib/linuxlocker/restore-splash
         echo "[CHROOT] Splash stripped; marker written for post-encryption-setup.sh."
     fi
+    CL_STRIP_TOKENS=""
 fi
 
 # ── 7d: Rebuild GRUB config ───────────────────────────────────────────────
@@ -3027,7 +3478,16 @@ if [ -n "$GRUB_UPDATE_TOOL" ]; then
             fi
             ;;
     esac
-    $GRUB_REBUILT && echo "[CHROOT] GRUB config rebuilt." || echo "[CHROOT] WARN: Could not rebuild GRUB config."
+    if $GRUB_REBUILT; then
+        echo "[CHROOT] GRUB config rebuilt."
+    elif [ -n "$LUKS_BOOT_ARGS" ] && [ ! -d /boot/loader/entries ]; then
+        # No BLS entries: grub.cfg IS the boot configuration, and it still
+        # carries the pre-encryption command line without the unlock args.
+        echo "[CHROOT] FAIL: Could not rebuild GRUB config, and grub.cfg is what boots this machine."
+        ERRORS=$((ERRORS + 1))
+    else
+        echo "[CHROOT] WARN: Could not rebuild GRUB config."
+    fi
 
     # Detect an ESP grub.cfg that has ALREADY been clobbered with a full config
     # (by an earlier tool run, or a guide-following mishap).
@@ -3246,12 +3706,22 @@ fi
 # ─── V3: /etc/default/grub ───────────────────────────────────────────────────
 if [ -f /mnt/etc/default/grub ] && [ -n "$LUKS_BOOT_ARGS" ]; then
     CHECKS=$((CHECKS + 1))
-    if grep -qF "$LUKS_BOOT_ARGS" /mnt/etc/default/grub; then
-        log "  V3 OK: LUKS arguments in GRUB_CMDLINE_LINUX"
+    # The value grub-mkconfig uses is the one left after every
+    # /etc/default/grub.d/*.cfg has been sourced, not the line in the file.
+    GRUB_EFFECTIVE=$(cl_grub_effective /mnt GRUB_CMDLINE_LINUX || true)
+    if cl_has_all_args "$GRUB_EFFECTIVE"; then
+        log "  V3 OK: effective GRUB_CMDLINE_LINUX carries the LUKS arguments"
     else
-        err "  V3 FAIL: LUKS arguments not in GRUB_CMDLINE_LINUX!"
+        err "  V3 FAIL: effective GRUB_CMDLINE_LINUX lacks the LUKS arguments: '$GRUB_EFFECTIVE'"
         ERRORS=$((ERRORS + 1))
     fi
+    for gd in /mnt/etc/default/grub /mnt/etc/default/grub.d/*.cfg; do
+        [ -f "$gd" ] || continue
+        if grep -qE '^[[:space:]]*GRUB_FORCE_PARTUUID=' "$gd"; then
+            err "  V3 FAIL: ${gd#/mnt} still sets GRUB_FORCE_PARTUUID — GRUB would boot root=PARTUUID past the mapper!"
+            ERRORS=$((ERRORS + 1))
+        fi
+    done
 elif [ -f /mnt/etc/default/grub ]; then
     log "  V3 SKIP: $INITRAMFS_STYLE unlocks via crypttab — GRUB cmdline needs no LUKS args"
 else
@@ -3321,8 +3791,15 @@ if [ -n "$GRUB_CFG" ]; then
          || { [ -n "$LUKS_BOOT_ARGS" ] && grep -qF "$LUKS_BOOT_ARGS" "$GRUB_CFG"; }; then
         log "  V6 OK: GRUB config references the encrypted root"
         BOOTCFG_OK=1
+    elif [ -n "$LUKS_BOOT_ARGS" ]; then
+        # This initramfs needs the arguments on the command line, grub.cfg is
+        # that command line (no BLS), and they are not in it.
+        err "  V6 FAIL: ${GRUB_CFG#/mnt} carries neither /dev/mapper/$LUKS_NAME nor '$LUKS_BOOT_ARGS'"
+        err "           — the regenerated GRUB config would not unlock the root!"
+        ERRORS=$((ERRORS + 1))
+        BOOTCFG_OK=1
     else
-        warn "  V6 WARN: GRUB config mentions neither blscfg, /dev/mapper/$LUKS_NAME, nor the LUKS args"
+        warn "  V6 WARN: GRUB config mentions neither blscfg nor /dev/mapper/$LUKS_NAME (crypttab-driven unlock; OK if root=UUID= is the inner filesystem)"
         BOOTCFG_OK=1     # config exists; contents warning only
     fi
 fi
@@ -3446,8 +3923,17 @@ if [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "${#UKI_PATHS[@]}" -gt 0 ]; then
             ERRORS=$((ERRORS + 1))
             continue
         fi
-        if echo "$UKI_CL" | grep -qF "root=UUID=$ORIG_FS_UUID"; then
-            err "  V11 FAIL: ${uki#/mnt} .cmdline still points root= at the pre-encryption UUID!"
+        # root=UUID=<inner fs uuid> is CORRECT after encryption (the filesystem
+        # keeps its UUID); what must not survive is root=PARTUUID=<partition>
+        # or root=/dev/<partition>, which name the raw LUKS container.
+        UKI_BAD=""
+        for uki_tok in $UKI_CL; do
+            case "$uki_tok" in
+                root=*|resume=*) cl_ref_is_target "${uki_tok#*=}" && UKI_BAD="$uki_tok" ;;
+            esac
+        done
+        if [ -n "$UKI_BAD" ]; then
+            err "  V11 FAIL: ${uki#/mnt} .cmdline still has '$UKI_BAD' — the raw partition, not the mapper!"
             ERRORS=$((ERRORS + 1))
             continue
         fi
@@ -3518,8 +4004,56 @@ else
     log "  V13 SKIP: systemd-boot not detected on this target"
 fi
 
-# Add chroot errors to total
-ERRORS=$((ERRORS + CHROOT_RC))
+# ─── V14: every kernel command-line carrier ──────────────────────────────────
+# /etc/kernel/cmdline, cmdline.d, Type #1 entries wherever the ESP is,
+# extlinux, cmdline.txt, rEFInd, Limine, GRUB drop-ins: none may still name
+# the raw partition in root=/resume=, and the ones an initramfs reads its
+# arguments from must carry them.
+V14_TOTAL=0; V14_BAD=0
+while IFS=$'\t' read -r ckind cpath; do
+    [ -n "$cpath" ] || continue
+    V14_TOTAL=$((V14_TOTAL + 1))
+    case "$ckind" in
+        limine-default) BADREF=$(cl_carrier_bad_root grubvar "$cpath" 'KERNEL_CMDLINE(\[[^]]*\])?') ;;
+        grubd)          BADREF=$(cl_carrier_bad_root grubvar "$cpath" 'GRUB_CMDLINE_LINUX(_DEFAULT)?') ;;
+        *)              BADREF=$(cl_carrier_bad_root "$ckind" "$cpath") ;;
+    esac
+    if [ -n "$BADREF" ]; then
+        err "  V14 FAIL: ${cpath#/mnt} still names the raw partition: $(echo "$BADREF" | tr '\n' ' ')"
+        ERRORS=$((ERRORS + 1)); V14_BAD=$((V14_BAD + 1))
+        continue
+    fi
+    if [ -n "$LUKS_BOOT_ARGS" ]; then
+        case "$ckind" in
+            dropin|grubd) ;;   # fragments: the arguments live in one dedicated file / the main grub file
+            cmdline)
+                # /etc/kernel/cmdline may legitimately leave the arguments to
+                # /etc/cmdline.d/90-linuxlocker.conf, and vice versa.
+                if ! cl_has_all_args "$(tr '\n' ' ' < "$cpath")" \
+                   && ! { [ -f /mnt/etc/cmdline.d/90-linuxlocker.conf ] && cl_has_all_args "$(cat /mnt/etc/cmdline.d/90-linuxlocker.conf)"; }; then
+                    err "  V14 FAIL: ${cpath#/mnt} lacks the LUKS arguments!"
+                    ERRORS=$((ERRORS + 1)); V14_BAD=$((V14_BAD + 1))
+                fi ;;
+            *)
+                if ! grep -qF "$LUKS_BOOT_ARGS" "$cpath"; then
+                    err "  V14 FAIL: ${cpath#/mnt} ($ckind) lacks the LUKS arguments!"
+                    ERRORS=$((ERRORS + 1)); V14_BAD=$((V14_BAD + 1))
+                fi ;;
+        esac
+    fi
+done < <(cl_find_carriers /mnt)
+if [ "$V14_TOTAL" -gt 0 ]; then
+    CHECKS=$((CHECKS + 1))
+    [ "$V14_BAD" -eq 0 ] && log "  V14 OK: $V14_TOTAL command-line carrier(s) point at the mapper and carry the arguments"
+else
+    log "  V14 SKIP: no additional command-line carriers on this target"
+fi
+
+# Add the chroot's and stage 6's recorded problems to the total
+if [ "${CONFIG_ERRORS:-0}" -gt 0 ]; then
+    err "  Stage 6 recorded $CONFIG_ERRORS configuration problem(s) — see the [ERROR] lines above."
+fi
+ERRORS=$((ERRORS + CHROOT_RC + ${CONFIG_ERRORS:-0}))
 
 # ─── Verification Result ─────────────────────────────────────────────────────
 echo ""
@@ -3547,6 +4081,7 @@ echo "  fstab       : /dev/mapper/$LUKS_NAME (was UUID=$ORIG_FS_UUID)"
 [ -d /mnt/boot/loader/entries ]  && [ -n "$LUKS_BOOT_ARGS" ] && echo "  BLS entries : ALL updated with LUKS parameters"
 [ -n "$RPI_CMDLINE" ]            && echo "  cmdline.txt : root=/dev/mapper/$LUKS_NAME"
 [ -n "$EXTLINUX_CONF" ]          && echo "  extlinux    : root=/dev/mapper/$LUKS_NAME"
+[ "${V14_TOTAL:-0}" -gt 0 ]      && echo "  cmdline     : $V14_TOTAL carrier file(s) verified (V14)"
 echo "  initramfs   : ALL kernels rebuilt via $INITRAMFS_STYLE with LUKS unlock support"
 if [ "$LL_HAVE_UKI_LIB" -eq 1 ] && [ "${#UKI_PATHS[@]}" -gt 0 ]; then
     echo "  UKI         : ${#UKI_PATHS[@]} image(s) rebuilt via ${UKI_REGEN}, signed via ${UKI_SIGN} (Secure Boot: ${UKI_SB_STATE})"
