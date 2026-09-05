@@ -707,11 +707,21 @@ recovery tool you cannot use from a minimal live environment.
 [SECURITY.md](SECURITY.md) first: the recovery key, the header backups and the
 recovery bundle are key material, not diagnostics.
 
+## Audit
+
+Audited in full on 2026-09-05 by **Claude Fable 5.1** (Anthropic) for code
+excellence: every script, the test suites and the documentation, with each
+finding reproduced before it was fixed. The results shipped as v1.4.0 through
+v1.4.3 — five real bugs, the command-line carrier layer, encrypted-`/boot`
+recognition, the harden-only guarantee — and v1.5.0 marks the audited state.
+Nothing in this tool has changed hands: the design decisions are the
+author's, the audit checked that the code keeps them.
+
 ## License and contact
 
 MIT — see [LICENSE](LICENSE).
 
-- **Version:** 1.4.3
+- **Version:** 1.5.0
 - **Author:** William MacKinnon ([doug445](https://github.com/doug445))
 - **Email:** spilled-bowline0j@icloud.com
 - **Repository:** https://github.com/doug445/LinuxLocker
