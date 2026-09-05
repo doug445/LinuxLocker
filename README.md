@@ -174,7 +174,8 @@ has that much slack). Full matrix and workarounds:
 
 ## KDF profiles — argon2id only
 
-Three presets. All argon2id; there is deliberately no pbkdf2 profile, and the
+Three presets: By Design, there are none weak profiles.
+All argon2id; there is deliberately no pbkdf2 profile, and the
 `fast` profile is a **hard floor** — the tool refuses to write anything
 cheaper, with no override flag.
 
