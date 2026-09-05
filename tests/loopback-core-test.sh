@@ -34,7 +34,9 @@
 #   2. in-place `cryptsetup reencrypt --encrypt` with our flags succeeds
 #   3. the result is LUKS2/argon2id, opens, and the inner btrfs (subvols,
 #      files) survived intact
-#   4. recovery-key enrollment (luksAddKey via key-files) unlocks the volume
+#   4. recovery-key enrollment (luksAddKey via key-files) unlocks the volume,
+#      and the new keyslot keeps the sha512 AF hash (luksAddKey without
+#      --hash stamps cryptsetup's sha256 default — a silent downgrade)
 #   5. an initialized-but-unfinished reencrypt carries the online-reencrypt
 #      flag and finishes with --resume-only  (built with --init-only, so it
 #      is deterministic — no race against a live reencrypt)
@@ -46,7 +48,7 @@
 #      content survival, resize2fs grow — the same handlers luks-deploy.sh
 #      uses for every ext2/3/4 target
 #   8. LUKS1 → LUKS2 conversion + argon2id keyslot re-costing (the
-#      convert_luks1 sequence) on a LUKS1-formatted volume
+#      convert_luks1 sequence) on a LUKS1-formatted volume, AF hash pinned
 #
 # Run as root:  sudo bash tests/loopback-core-test.sh
 # Requires: cryptsetup >= 2.4, btrfs-progs, e2fsprogs, util-linux (losetup).
@@ -173,12 +175,18 @@ pass "resize max ok"
 
 echo "== 4. recovery-key enrollment (luks-deploy's luksAddKey shape) =="
 od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > "$WORK/rk"; chmod 600 "$WORK/rk"
-cryptsetup luksAddKey --key-file "$WORK/pass" "$LOOP1" "$WORK/rk" "${KDF[@]}"
+cryptsetup luksAddKey --key-file "$WORK/pass" "$LOOP1" "$WORK/rk" --hash sha512 "${KDF[@]}"
 cryptsetup close "$MAP1"
 cryptsetup open --key-file "$WORK/rk" "$LOOP1" "$MAP1" \
     && pass "recovery key unlocks the volume" \
     || fail "recovery key cannot unlock"
 cryptsetup close "$MAP1"
+# Every keyslot must carry the AF hash luksFormat/reencrypt was given; a slot
+# added without --hash comes back as sha256 (verified on cryptsetup 2.8.7).
+AF_HASHES=$(cryptsetup luksDump "$LOOP1" | awk '/^[[:space:]]+AF hash:/{print $3}' | sort -u | paste -sd,)
+[ "$AF_HASHES" = "sha512" ] \
+    && pass "every keyslot (passphrase + recovery) has AF hash sha512" \
+    || fail "AF hashes after luksAddKey: $AF_HASHES (expected only sha512)"
 
 echo "== 5. an unfinished reencrypt carries the resume flag and finishes =="
 truncate -s 1200M "$WORK/disk2.img"
@@ -317,10 +325,14 @@ V=$(cryptsetup luksDump "$LOOP5" | awk '/^Version:/{print $2; exit}')
 cryptsetup luksDump "$LOOP5" | grep -q 'pbkdf2' \
     && pass "keyslot still pbkdf2 after conversion (as expected)" \
     || fail "expected a pbkdf2 keyslot right after conversion"
-cryptsetup luksConvertKey -S 0 "${KDF[@]}" --key-file "$WORK/pass" "$LOOP5"
+cryptsetup luksConvertKey -S 0 --hash sha512 "${KDF[@]}" --key-file "$WORK/pass" "$LOOP5"
 cryptsetup luksDump "$LOOP5" | grep -q 'argon2id' \
     && pass "luksConvertKey re-costed slot 0 to argon2id" \
     || fail "slot 0 is not argon2id after luksConvertKey"
+AF5=$(cryptsetup luksDump "$LOOP5" | awk '/^[[:space:]]+AF hash:/{print $3; exit}')
+[ "$AF5" = "sha512" ] \
+    && pass "re-costed slot carries AF hash sha512 (--hash pinned)" \
+    || fail "re-costed slot AF hash is '$AF5'"
 assert_unlocks "$LOOP5" "$MAP2" "converted LUKS1→LUKS2 volume"
 
 echo ""

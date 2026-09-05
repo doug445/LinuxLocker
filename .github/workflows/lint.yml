@@ -59,3 +59,17 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q binutils
       - name: UKI fixture test
         run: bash tests/uki-fixture-test.sh
+
+  cmdline-fixtures:
+    # Kernel command-line carriers (BLS/systemd-boot entries, extlinux, rEFInd,
+    # Limine, GRUB drop-ins, cmdline.d) and the encrypted-/boot recogniser in
+    # bin/lib-boot.sh, against synthetic files. No disk, no root, no network.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: command-line carrier fixture test
+        run: bash tests/cmdline-fixture-test.sh

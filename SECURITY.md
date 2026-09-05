@@ -100,10 +100,21 @@ interesting surface:
   `online-reencrypt` flag detection, and the automatic `cryptsetup repair` after
   a hard kill acting on a device or header that does not match the state the
   interrupted run recorded.
-* **The LUKS1 conversion gate not gating.** Converting keyslots to argon2id on a
-  volume that **GRUB itself** unlocks (`cryptomount`, encrypted `/boot`) leaves
-  a machine that cannot boot at all — GRUB cannot open an argon2id keyslot. That
-  warning gate firing late, not firing, or being bypassable is in scope.
+* **The encrypted-`/boot` recogniser being wrong in the unsafe direction.**
+  `lib-boot.sh` decides from the GRUB images on the disk and the volume's own
+  layout whether GRUB itself unlocks a volume, whether that GRUB reads LUKS2,
+  and whether it embeds the argon2 module. A false "GRUB does not unlock this"
+  lets the LUKS1 conversion or `luks-tune.sh` write a header or keyslot GRUB
+  cannot open; a false "argon2 supported" does the same; and a target whose
+  `/boot` lives inside the volume being encrypted must be refused before the
+  shrink. Any of those firing late, not firing, or being bypassable is in scope.
+* **A command-line carrier missed or corrupted.** Every file that carries a
+  kernel command line — GRUB defaults and `grub.d` drop-ins, BLS/systemd-boot
+  entries in any ESP layout, `/etc/kernel/cmdline`, `cmdline.d`, `cmdline.txt`,
+  `extlinux.conf`, `refind_linux.conf`, `limine.conf` — must end up pointing
+  `root=` at the mapper and carrying the unlock arguments, and a file the
+  rewriter does not understand must be left byte-identical. Check V14 reads them
+  back; a carrier that passes V14 and still boots the raw partition is a bug.
 * **A filesystem handler shrinking what it must not.** The 32 MiB header gap is
   taken by `resize2fs`, `btrfs filesystem resize`, `resize.f2fs`, `ntfsresize`
   or `fatresize` depending on the target. xfs cannot shrink and is accepted only

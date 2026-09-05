@@ -32,9 +32,18 @@ Arch, Manjaro, EndeavourOS and openSUSE. Converts LUKS1 to a LUKS2 container.
 container holding that same filesystem. Your files and the filesystem UUID
 survive; the partition simply gains an encryption layer. It then rewrites every
 piece of boot configuration that has to change — `crypttab`, `fstab`, GRUB
-defaults, BLS entries, `cmdline.txt`, `extlinux.conf`, initramfs generator
+defaults and their `grub.d` drop-ins, BLS and systemd-boot entries wherever
+the ESP is, `/etc/kernel/cmdline` and `cmdline.d`, `cmdline.txt`,
+`extlinux.conf`, `refind_linux.conf`, `limine.conf`, initramfs generator
 config, **all** initramfs images — and refuses to let you reboot until a full
-verification gate passes.
+verification gate passes. A `root=PARTUUID=` or `root=/dev/…` that names the
+raw partition is rewritten to the mapper in every one of those.
+
+`/boot` stays unencrypted, and that is a design decision, not a gap: a target
+whose `/boot` lives on the root filesystem under GRUB is refused before
+anything is touched, and a volume that GRUB *already* unlocks (an existing
+encrypted `/boot`) is recognised and offered only what GRUB can take — see
+[Why is `/boot` left unencrypted?](#why-is-boot-left-unencrypted).
 
 The front door, `linuxlocker.sh`, first **identifies the live environment's OS
 and package manager**, installs any tools the run needs, and only then hands
@@ -167,7 +176,7 @@ has that much slack). Full matrix and workarounds:
 | plain filesystem | normal encryption run |
 | LUKS2 header with `online-reencrypt` flag | a previous run was interrupted → finishes it (`--resume-only`, with automatic `cryptsetup repair` after a hard kill), then redoes config |
 | complete LUKS2 header | shows a truncated `luksDump`, then offers: **tune** (launches `luks-tune.sh` to raise the KDF), **config** (redo boot config + verification), or **quit** |
-| LUKS1 header | offers in-place **conversion to LUKS2** (`cryptsetup convert`), then re-costs each keyslot to argon2id using the same three profiles — with an explicit warning gate for GRUB-unlocked (`cryptomount`) volumes, which cannot open argon2id slots |
+| LUKS1 header | offers in-place **conversion to LUKS2** (`cryptsetup convert`), then re-costs each keyslot to argon2id using the same three profiles. A volume that **GRUB itself** unlocks (encrypted `/boot`) is recognised from the GRUB images on the disk and the volume's own layout: conversion is refused unless that GRUB demonstrably reads LUKS2, and the argon2id re-cost is offered only when it embeds the argon2 module — at 1 GiB, with the unlock estimate multiplied by GRUB's slowdown |
 | no `/etc/fstab` inside | offers **data-partition mode**: encrypt + recovery key + header backup, no boot config |
 
 ---
@@ -246,6 +255,16 @@ and what each cost buys against a GPU fleet, backs the header up first, and
 never touches data, passphrases, or keyslot existence. It also converts
 leftover pbkdf2 keyslots to argon2id.
 
+On a volume that **GRUB itself unlocks** (an encrypted `/boot` you set up
+elsewhere), `luks-tune.sh` recognises that and offers only what GRUB can open:
+argon2id only when the GRUB image embeds the argon2 module (stock GRUB 2.12
+does not; a 2.14 build does), memory capped at **1 GiB** — argon2id needs its
+whole memory cost as one contiguous allocation from the firmware heap, and x86
+UEFI has never reliably handed out more — and every unlock estimate multiplied
+by GRUB's single-threaded slowdown (**8.5×**, measured on one machine;
+`LUKS_GRUB_KDF_FACTOR` overrides it). Nothing here sets an encrypted `/boot` up
+or re-embeds a GRUB image.
+
 ---
 
 ## What's in here
@@ -256,6 +275,7 @@ leftover pbkdf2 keyslots to argon2id.
 | `bin/luks-deploy.sh` | **The main event.** In-place LUKS2 encryption, run from a live USB. Auto-detects everything, resolves boot partitions from the target's fstab, self-repairs failed initramfs steps, fixes SELinux labels, and gates the reboot behind verification. Fully resumable. |
 | `bin/lib-deps.sh` | Shared OS / package-manager detection, dependency installer, and the Fedora Asahi Remix guard (sourced, not run). |
 | `bin/lib-uki.sh` | UKI / systemd-boot / Secure Boot support (sourced, not run): finds `EFI/Linux/*.efi` across every ESP layout, picks the rebuild backend and the signer, rebuilds and signs, and reads the `.cmdline` and `.initrd` sections back out of a PE binary. `UKI_DRY=1` prints the commands instead of running them. |
+| `bin/lib-boot.sh` | Kernel command-line carriers and encrypted-`/boot` recognition (sourced, not run). One transform for every file format that carries a command line — BLS/systemd-boot entries in any ESP layout, `extlinux.conf`, `cmdline.txt`, `/etc/kernel/cmdline`, `cmdline.d`, `refind_linux.conf`, `limine.conf`, GRUB defaults and `grub.d` drop-ins — rewriting `root=`/`resume=` to the mapper, adding the unlock arguments, stripping and restoring the splash, without touching a line it does not understand. Also reads the GRUB images on a disk to tell whether GRUB itself unlocks a volume and whether it can read LUKS2 / open argon2id. |
 | `bin/luks-tune.sh` | ncurses KDF re-costing for existing LUKS2 volumes. Pins `--hash sha512` so a re-cost cannot walk a slot's AF hash back to cryptsetup's `sha256` default. `--dry-run` prints the command and changes nothing. |
 | `bin/post-encryption-setup.sh` | Run once on the newly-encrypted system: recovery bundle, snapper subvolumes (btrfs roots), splash-argument restore, verification. Idempotent. |
 | `bin/save-luks-recovery-bundle.sh` | Labeled recovery bundle: fresh header backup + crypttab/fstab/boot state + a README with distro-specific repair commands. **Key material — never attach it to a bug report.** |
@@ -263,6 +283,7 @@ leftover pbkdf2 keyslots to argon2id.
 | `extras/` | Optional: `luks-fetch-cache`, a disk-encryption status readout for fastfetch (LUKS **and** BitLocker volumes — KDF, cipher, protectors; public header metadata only). Its `install.sh` also installs fastfetch itself if missing. |
 | `tests/loopback-core-test.sh` | CI-safe loopback test of the whole core: shrink guards, reencrypt, resume, hard-kill repair, recovery keys, the ext4 path, and LUKS1→LUKS2 conversion. Touches no real disk, and runs on every push against x86_64 **and** aarch64 runners. |
 | `tests/uki-fixture-test.sh` | CI-safe fixture test of the UKI / systemd-boot / Secure Boot logic: every ESP layout, every rebuild backend, every signer, the refusal matrix, `.cmdline` round-trips through a real PE binary, and the Asahi guard. Needs no root and no disk. Run it as root on a UKI machine and section 10 also self-checks detection against that real system. |
+| `tests/cmdline-fixture-test.sh` | CI-safe fixture test of `lib-boot.sh`: every command-line carrier format round-trips, `root=PARTUUID=`/`root=/dev/…` rewriting, idempotency, `grub.d` overrides, CRLF and comment tolerance, and the encrypted-`/boot` recogniser against stock-2.12 and argon2-2.14 image signatures. Needs no root and no disk. |
 | `docs/` | [ABOUT](docs/ABOUT.md) · [INSTALL](docs/INSTALL.md) · [FILESYSTEMS](docs/FILESYSTEMS.md) · [RECOVERY](docs/RECOVERY.md) |
 | `SECURITY.md` | What is in scope, what is not, and **what never to attach to a bug report** — the artefacts this tool produces can be the keys themselves. |
 | `.github/rulesets/` | Branch and tag protection as JSON, not as settings someone clicked once: `main` and every `v*` tag are protected from deletion and force-push. |
@@ -299,6 +320,10 @@ LUKS_UKI_SIGN=<backend>                    force the signer: sbctl|sbsign|none
 LUKS_SB_KEY / LUKS_SB_CERT                 explicit sbsign key + certificate
 LUKS_SKIP_UKI_SIGN=1                       rebuild the UKI but do not sign it
 LUKS_SB_STATE=enabled|disabled             override Secure Boot autodetection
+LUKS_GRUB_KDF_FACTOR=<x>                   unlock-time multiplier for a volume GRUB
+                                           itself unlocks (default 8.5, measured)
+LUKS_GRUB_ARGON2_MAX_KIB=<n>               argon2id ceiling for such a volume
+                                           (default 1 GiB — the x86 UEFI heap)
 ```
 
 The UKI and Secure Boot knobs are documented in full, with detection order and
@@ -351,12 +376,17 @@ nothing.
 - A wrong partition selection is catastrophic. The script cross-checks your
   selection against the target's own fstab and makes you type `ENCRYPT`, but
   the final authority is you.
-- Forgetting the passphrase (or a Caps-Locked passphrase — the script checks
-  the LED state and warns) with no recovery key enrolled means the data is
-  gone. That is the feature working as designed.
-- On LUKS1 systems where **GRUB itself** unlocks the disk (encrypted `/boot`,
-  `cryptomount`), converting keyslots to argon2id would make the system
-  unbootable — the conversion flow warns and gates on this explicitly.
+- Forgetting the passphrase — or setting it with Caps Lock on, which
+  `cryptsetup`'s type-it-twice check cannot catch — with no recovery key
+  enrolled means the data is gone. The script guards the second case by
+  requiring a lower-case `yes` immediately before the passphrase prompt:
+  it cannot be typed with Caps Lock on. That is the feature working as
+  designed.
+- On systems where **GRUB itself** unlocks the disk (encrypted `/boot`,
+  `cryptomount`), a LUKS2 header its GRUB cannot read or an argon2id keyslot
+  its GRUB cannot open makes the system unbootable. Such volumes are
+  recognised from the GRUB images and refused or capped accordingly; nothing
+  here sets up an encrypted `/boot`.
 
 ---
 
@@ -415,10 +445,30 @@ volumes you encrypted earlier.
 
 The root volume is unlocked by the initramfs, which can afford a real argon2id
 cost. An encrypted `/boot` has to be unlocked by GRUB, which is far more
-constrained — and weakening the KDF to fit the bootloader trades a strong
-defence for a partial one. If your system already has GRUB unlocking an
-encrypted `/boot` (`cryptomount`), the LUKS1 conversion flow explicitly gates
-on that, because argon2id keyslots are ones GRUB cannot open at all.
+constrained: it runs the KDF single-threaded with no SIMD — about **8.5× slower**
+than the initramfs for the same parameters, measured — it takes argon2id's
+memory as **one contiguous allocation** from the firmware heap, which on x86
+UEFI has never reliably meant more than **1 GiB** (4 GiB overflows GRUB
+outright), and whether it can open argon2id at all depends on the build: stock
+GRUB 2.12 prints *Argon2 not supported*. Weakening the root KDF to fit the
+bootloader trades a strong defence for a partial one.
+
+So LinuxLocker **recognises** encrypted `/boot` and **never sets it up**:
+
+- A target whose `/boot` lives on the root filesystem under GRUB or extlinux is
+  **refused before the shrink**, with the reason and the fix (a separate,
+  unencrypted `/boot` partition — 1 GiB is plenty). The old behaviour encrypted
+  it and reported success on a machine whose GRUB could no longer find a kernel.
+- A volume GRUB *already* unlocks is detected from the GRUB images on the disk
+  (the embedded early config names the UUID it `cryptomount`s) and from the
+  volume's own layout. On it, `luks-tune.sh` and the LUKS1 conversion offer
+  only what that GRUB can take: LUKS2 only if the image reads it, argon2id only
+  if the image embeds the argon2 module, 1 GiB at most, and unlock estimates
+  multiplied by GRUB's slowdown.
+
+Apple Silicon under U-Boot's EFI has been measured allocating 2 GiB; that is
+AsahiLocker's territory and out of scope here. Details:
+[BOOTLOADERS.md](docs/BOOTLOADERS.md#encrypted-boot).
 
 ### What happens if the encryption is interrupted — power loss, a crash, a closed lid?
 
@@ -516,7 +566,23 @@ the full matrix and the workarounds for xfs, exfat, udf and swap.
 Yes, without re-encrypting anything. `sudo ./bin/luks-tune.sh` re-costs existing
 keyslots to a stronger argon2id profile, backs the header up first, and never
 touches data, passphrases or keyslot existence. A LUKS1 volume is offered an
-in-place conversion to LUKS2 first.
+in-place conversion to LUKS2 first. If GRUB itself unlocks the volume, both
+tools say so and stay within GRUB's ceiling (above).
+
+### My root= is `PARTUUID=…`, or my bootloader is rEFInd / Limine / systemd-boot with the ESP at `/efi`
+
+Handled. Every file that carries a kernel command line is found and rewritten:
+a `root=` or `resume=` that names the raw partition — `PARTUUID=`,
+`PARTLABEL=`, `/dev/nvme0n1p3`, `/dev/disk/by-id/…` — becomes
+`/dev/mapper/root_crypt`, while `root=UUID=<filesystem uuid>` is left alone
+because the filesystem keeps its UUID inside the container. Ubuntu's
+`/etc/default/grub.d/*.cfg` drop-ins, which override `/etc/default/grub` when
+`grub-mkconfig` runs, get the same edit, and `GRUB_FORCE_PARTUUID` (cloud
+images) is disabled because it boots `root=PARTUUID=` straight past the mapper.
+A UKI target with no `/etc/kernel/cmdline` gets one seeded from the UKI's own
+`.cmdline`, so the rebuild cannot bake in the live USB's `/proc/cmdline`. Check
+V14 then reads every carrier back. Nothing in this stage aborts the run: a file
+that cannot be rewritten is reported and the gate refuses the reboot.
 
 ### How do I check what I actually ended up with?
 
@@ -576,10 +642,11 @@ Before opening a pull request, run what CI runs:
 shellcheck -S warning $(git ls-files '*.sh') extras/bin/luks-fetch-cache
 sudo bash tests/loopback-core-test.sh
 bash tests/uki-fixture-test.sh
+bash tests/cmdline-fixture-test.sh
 ```
 
-Expect `29 passed, 0 failed` from the loopback suite and `0 failed` from the
-fixture suite. The loopback suite exercises the whole encryption core — shrink
+Expect `31 passed, 0 failed` from the loopback suite and `0 failed` from the
+fixture suites (`bash tests/cmdline-fixture-test.sh` is the third). The loopback suite exercises the whole encryption core — shrink
 guards, in-place re-encryption, `--resume-only`, a hard kill mid-re-encrypt
 followed by `cryptsetup repair`, recovery keys, the ext4 path and LUKS1 → LUKS2
 conversion — against file-backed loop devices. The fixture suite exercises the
@@ -602,7 +669,7 @@ recovery bundle are key material, not diagnostics.
 
 MIT — see [LICENSE](LICENSE).
 
-- **Version:** 1.2.0
+- **Version:** 1.4.0
 - **Author:** William MacKinnon ([doug445](https://github.com/doug445))
 - **Email:** spilled-bowline0j@icloud.com
 - **Repository:** https://github.com/doug445/LinuxLocker

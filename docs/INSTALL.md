@@ -3,6 +3,14 @@
 ## What you need
 
 - The target machine, with its Linux install intact and **backed up**.
+- A **separate, unencrypted `/boot` partition** if the machine boots with GRUB
+  or extlinux. Fedora-family installs always have one; Debian, Ubuntu and
+  openSUSE defaults often keep `/boot` on the root filesystem, and LinuxLocker
+  refuses those before touching anything — encrypting them would make GRUB
+  itself responsible for the unlock, which this tool never sets up (see
+  [BOOTLOADERS.md](BOOTLOADERS.md#encrypted-boot)). UKI, systemd-boot and
+  Raspberry Pi targets keep their kernel on the ESP or firmware partition and
+  are fine without one.
 - A live USB for that machine. The safest choice is the target distro's own
   live ISO (it guarantees kernel + filesystem tool compatibility); any live
   Linux with `cryptsetup ≥ 2.4` available works.
@@ -51,8 +59,10 @@ The deploy script then walks you through:
 - **Integrity check** — optional read-only fsck before anything changes.
 - **KDF profile** — aggressive / moderate / fast, with unlock-time estimates
   benchmarked on the machine in front of you.
-- **The `ENCRYPT` gate** — a typed confirmation, then the passphrase
-  (watch the Caps Lock warning; the script checks the LED).
+- **The `ENCRYPT` gate** — a typed confirmation. Immediately before
+  `cryptsetup` asks for the passphrase, the script asks you to type `yes` in
+  lower case: that cannot be entered with Caps Lock on, so accepting it is the
+  proof the passphrase you are about to set is the one you think it is.
 
 Everything after that is automated: shrink, in-place encryption, verification
 of the inner filesystem, boot configuration, initramfs rebuilds, and the

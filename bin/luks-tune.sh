@@ -54,6 +54,16 @@
 #                    filesystem data, or offer pbkdf2. There is no code path
 #                    here that selects pbkdf2; see README, "Never use pbkdf2".
 #
+# Volumes that GRUB itself unlocks (encrypted /boot) are RECOGNISED, through
+# bin/lib-boot.sh: the GRUB images on the disk and the volume's own layout
+# say so. On such a volume this tool offers only what GRUB can take: argon2id
+# is offered only when the GRUB image demonstrably embeds the argon2 module,
+# memory is capped at 1 GiB (argon2id wants one contiguous allocation and the
+# x86 UEFI heap has never reliably given more), and the unlock estimate is
+# multiplied by GRUB's single-threaded slowdown (8.5x, measured; override
+# with LUKS_GRUB_KDF_FACTOR). It never sets up an encrypted /boot and never
+# writes pbkdf2, so a GRUB without argon2 is told so and left alone.
+#
 # The passphrase is never read, stored or passed by this script. cryptsetup
 # prompts for it directly on the terminal, outside the ncurses UI.
 #
@@ -116,6 +126,17 @@ CRYPTSETUP=/usr/sbin/cryptsetup
 [ -x "$CRYPTSETUP" ] || CRYPTSETUP=/sbin/cryptsetup
 [ -x "$CRYPTSETUP" ] || { echo "cryptsetup not found" >&2; exit 1; }
 
+# Encrypted-/boot recognition lives in lib-boot.sh, next to this script.
+SELFDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -f "$SELFDIR/lib-boot.sh" ]; then
+    # shellcheck source=lib-boot.sh
+    . "$SELFDIR/lib-boot.sh"
+    HAVE_BOOT_LIB=1
+else
+    echo "luks-tune.sh: lib-boot.sh not found next to this script — cannot tell whether GRUB unlocks a volume; continuing without that check." >&2
+    HAVE_BOOT_LIB=0
+fi
+
 # ─── UI backend ──────────────────────────────────────────────────────────────
 if command -v dialog >/dev/null 2>&1; then UI=dialog
 elif command -v whiptail >/dev/null 2>&1; then UI=whiptail
@@ -152,6 +173,63 @@ done
 DEV=$(ui --title "Select a LUKS2 volume" \
          --menu "Keyslot parameters are per-volume." 16 74 6 \
          "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3) || { clear; exit 0; }
+
+# ─── Does GRUB itself unlock this volume? ────────────────────────────────────
+# Its mapper may be the running root ("" = this system), mounted somewhere
+# else (a live USB with the target at /mnt), or closed (image scan only).
+GRUB_MODE=0
+if [ "$HAVE_BOOT_LIB" -eq 1 ]; then
+    PROBE_ROOT=""; HAVE_PROBE_ROOT=0
+    DEV_MAPPER=$(lsblk -rno NAME,TYPE "$DEV" 2>/dev/null | awk '$2=="crypt"{print $1; exit}')
+    if [ -n "$DEV_MAPPER" ]; then
+        ROOT_SRC=$(findmnt -no SOURCE / 2>/dev/null | sed 's/\[.*//')
+        if [ "$ROOT_SRC" = "/dev/mapper/$DEV_MAPPER" ]; then
+            HAVE_PROBE_ROOT=1
+        else
+            PROBE_ROOT=$(findmnt -rno TARGET -S "/dev/mapper/$DEV_MAPPER" 2>/dev/null | head -1)
+            [ -n "$PROBE_ROOT" ] && [ -f "$PROBE_ROOT/etc/fstab" ] && HAVE_PROBE_ROOT=1
+        fi
+    fi
+    if [ "$HAVE_PROBE_ROOT" -eq 1 ]; then bt_grub_probe "$DEV" "$PROBE_ROOT"; else bt_grub_probe "$DEV"; fi
+    if [ "$BT_GRUB_UNLOCKS" -eq 1 ]; then
+        GRUB_MODE=1
+        if [ "$BT_GRUB_ARGON2" != "yes" ]; then
+            ui --title "GRUB unlocks this volume — argon2id not available" --msgbox \
+"GRUB itself opens $DEV at boot (encrypted /boot):
+  $BT_GRUB_EVIDENCE
+
+Its GRUB image could not be shown to embed the argon2 module
+(result: $BT_GRUB_ARGON2). Stock GRUB 2.12 prints 'Argon2 not
+supported'; a keyslot re-costed to argon2id would be one GRUB
+cannot open, and the machine would not boot.
+
+LinuxLocker never sets up or re-embeds an encrypted /boot and
+never writes pbkdf2 parameters, so nothing is offered here.
+To strengthen this volume: build or install a GRUB with argon2
+support, re-run grub-install so the image embeds it, then come
+back. See docs/BOOTLOADERS.md, 'Encrypted /boot'." 20 74 || true
+            clear; exit 1
+        fi
+        ui --title "GRUB unlocks this volume" --msgbox \
+"GRUB itself opens $DEV at boot (encrypted /boot):
+  $BT_GRUB_EVIDENCE
+
+Its GRUB image embeds the argon2 module, so argon2id keyslots
+can be re-costed — within what GRUB can do:
+
+  memory   capped at $(( BT_GRUB_ARGON2_MAX_KIB / 1024 )) MiB. argon2id needs its whole
+           memory cost as ONE contiguous allocation from the
+           firmware heap; x86 UEFI has never reliably given
+           more than 1 GiB (4 GiB overflows GRUB outright).
+  time     GRUB runs the KDF single-threaded with no SIMD. The
+           unlock estimates below are multiplied by ${BT_GRUB_KDF_FACTOR}
+           (measured on one machine; LUKS_GRUB_KDF_FACTOR overrides).
+  wall     long uninterrupted compute inside GRUB has tripped a
+           firmware watchdog past ~${BT_GRUB_RESET_WALL_S} s on some hardware.
+
+Only the 1 GiB profile and a custom cost within the cap are offered." 22 74 || { clear; exit 0; }
+    fi
+fi
 
 # ─── Show current state ──────────────────────────────────────────────────────
 slot_table() {   # $1 = device; emits "slot<TAB>kdf<TAB>mem_kib<TAB>iter<TAB>threads<TAB>afhash"
@@ -244,7 +322,17 @@ CUR_ITER=$(echo "$CUR" | cut -f4); CUR_PAR=$(echo "$CUR" | cut -f5)
 CUR_HASH=$(echo "$CUR" | cut -f6)
 
 # ─── Pick new parameters ─────────────────────────────────────────────────────
-CHOICE=$(ui --title "New argon2id cost for slot $SLOT" --menu \
+if [ "$GRUB_MODE" -eq 1 ]; then
+    CHOICE=$(ui --title "New argon2id cost for slot $SLOT (GRUB-unlocked volume)" --menu \
+"GRUB opens this volume, so memory is capped at $(( BT_GRUB_ARGON2_MAX_KIB / 1024 )) MiB — one
+contiguous allocation from the firmware heap. Within that cap,
+iterations are the only lever, and every one of them is paid
+single-threaded inside GRUB at every boot." 16 74 2 \
+    fast       "1 GiB x  9  at/above stock cryptsetup — ~24 GPU guesses at once" \
+    custom     "1 GiB max; set iterations / threads yourself" \
+    3>&1 1>&2 2>&3) || { clear; exit 0; }
+else
+    CHOICE=$(ui --title "New argon2id cost for slot $SLOT" --menu \
 "Memory cost is the thing an attacker cannot buy their way around.
 argon2id needs its full memory for EVERY guess, so a 24 GB GPU that
 would run thousands of guesses at once against a weak KDF gets ~6
@@ -256,6 +344,7 @@ argon2id's maximum, so past it only iterations raise the price." 22 74 6 \
     fast       "1 GiB x  9  at/above stock cryptsetup — ~24 at once" \
     custom     "set memory / iterations / threads yourself" \
     3>&1 1>&2 2>&3) || { clear; exit 0; }
+fi
 
 case "$CHOICE" in
     paranoid)   NEW_MEM=$P_PARANOID_MEM;   NEW_ITER=$P_PARANOID_ITER;   NEW_PAR=$P_PARALLEL ;;
@@ -305,6 +394,22 @@ If you really want this, run cryptsetup luksConvertKey yourself." 18 70
     clear; exit 1
 fi
 
+# ─── Refuse what GRUB cannot open ───────────────────────────────────────────
+if [ "$GRUB_MODE" -eq 1 ] && ! bt_grub_mem_ok "$NEW_MEM"; then
+    ui --title "Above GRUB's ceiling — refused" --msgbox \
+"$(human_mem "$NEW_MEM") is more than GRUB can allocate for argon2id on
+this volume's unlock path. The ceiling is $(( BT_GRUB_ARGON2_MAX_KIB / 1024 )) MiB: argon2id wants
+its whole memory cost as one contiguous block from the firmware
+heap, and x86 UEFI has never reliably handed out more than 1 GiB.
+(4 GiB overflows GRUB's 32-bit block count on every platform.)
+
+A keyslot written above the ceiling is one GRUB cannot open, and
+the machine would not boot. Raise iterations instead, or re-run
+with LUKS_GRUB_ARGON2_MAX_KIB set if you have MEASURED a higher
+allocation succeeding in GRUB on this exact machine." 18 74
+    clear; exit 1
+fi
+
 # ─── Confirm ─────────────────────────────────────────────────────────────────
 UUID=$("$CRYPTSETUP" luksUUID "$DEV")
 
@@ -325,7 +430,7 @@ BACKUP="/root/luks-header-${UUID}-${STAMP}.bin"
 # iterations fit in ~2000 ms, and CLAMPS the memory it will benchmark to what
 # it can allocate right now — so above that clamp this is scaled from a
 # smaller measurement, not measured outright.
-kdf_estimate() {   # $1 = mem KiB, $2 = iterations, $3 = threads
+kdf_estimate_ms() {   # $1 = mem KiB, $2 = iterations, $3 = threads -> milliseconds
     local out bi bm
     out=$("$CRYPTSETUP" benchmark --pbkdf argon2id --pbkdf-memory "$1" \
               --pbkdf-parallel "$3" 2>/dev/null | grep -m1 argon2id) || return 1
@@ -334,11 +439,24 @@ kdf_estimate() {   # $1 = mem KiB, $2 = iterations, $3 = threads
     case "$bm" in ''|*[!0-9]*) return 1;; esac
     [ "$bi" -gt 0 ] && [ "$bm" -gt 0 ] || return 1
     awk -v ti="$2" -v tm="$1" -v bi="$bi" -v bm="$bm" \
-        'BEGIN{ printf "%.1f s", 2.0 * (ti*tm) / (bi*bm) }'
+        'BEGIN{ printf "%.0f", 2000.0 * (ti*tm) / (bi*bm) }'
 }
+fmt_s() { case "$1" in ''|*[!0-9]*) printf '?';; *) awk -v m="$1" 'BEGIN{ printf "%.1f s", m/1000 }';; esac; }
 
-EST_CUR=$(kdf_estimate "$CUR_MEM" "$CUR_ITER" "$CUR_PAR" || echo "?")
-EST_NEW=$(kdf_estimate "$NEW_MEM" "$NEW_ITER" "$NEW_PAR" || echo "?")
+EST_CUR_MS=$(kdf_estimate_ms "$CUR_MEM" "$CUR_ITER" "$CUR_PAR" || echo "")
+EST_NEW_MS=$(kdf_estimate_ms "$NEW_MEM" "$NEW_ITER" "$NEW_PAR" || echo "")
+# What the operator waits for: the kernel-side figure, or GRUB's when GRUB
+# does the unlock. The attacker-cost table below always uses kernel-side
+# numbers — a cracking rig is not slowed down by the victim's bootloader.
+UNLOCK_WHERE="in the initramfs"
+if [ "$GRUB_MODE" -eq 1 ]; then
+    UNLOCK_WHERE="in GRUB (x${BT_GRUB_KDF_FACTOR})"
+    EST_CUR=$(fmt_s "$(bt_grub_ms "$EST_CUR_MS" || echo "")")
+    EST_NEW=$(fmt_s "$(bt_grub_ms "$EST_NEW_MS" || echo "")")
+else
+    EST_CUR=$(fmt_s "$EST_CUR_MS")
+    EST_NEW=$(fmt_s "$EST_NEW_MS")
+fi
 
 # What the cost is actually FOR. Attacker model, stated in the UI so the
 # figure can be checked rather than taken on faith: 1000 top-end GPUs, each
@@ -371,8 +489,7 @@ cosmic() {   # $1 = base-10 exponent of the crack time in years
     fi
 }
 
-EST_NEW_S=$(printf '%s' "$EST_NEW" | tr -dc '0-9.')
-[ -n "$EST_NEW_S" ] || EST_NEW_S=0
+EST_NEW_S=$(awk -v m="${EST_NEW_MS:-0}" 'BEGIN{ printf "%.3f", m/1000 }')
 strength_row() {   # $1 = label, $2 = passphrase bits
     local e; e=$(crack_years "$NEW_MEM" "$EST_NEW_S" "$2")
     case "$e" in ''|*[!0-9-]*) printf '  %-22s %s\n' "$1" "(not estimated)"; return;; esac
@@ -393,8 +510,18 @@ $(
   printf '  %-12s %-14s %s\n' 'iterations' "$CUR_ITER"                "$NEW_ITER"
   printf '  %-12s %-14s %s\n' 'threads'    "$CUR_PAR"                 "$NEW_PAR"
   printf '  %-12s %-14s %s\n' 'AF hash'    "$CUR_HASH"                "$HASH"
-  printf '  %-12s %-14s %s\n' 'unlock'     "~$EST_CUR"                "~$EST_NEW"
+  printf '  %-12s %-14s %s\n' 'unlock'     "~$EST_CUR"                "~$EST_NEW  $UNLOCK_WHERE"
 )
+$( if [ "$GRUB_MODE" -eq 1 ]; then
+     printf '\nGRUB does this unlock: single-threaded, no SIMD, so the kernel-side\n'
+     printf 'estimate is multiplied by %s (measured on one machine). ' "$BT_GRUB_KDF_FACTOR"
+     GW=$(bt_grub_ms "${EST_NEW_MS:-0}" || echo 0)
+     if [ "${GW:-0}" -ge $((BT_GRUB_RESET_WALL_S * 1000)) ]; then
+       printf 'That is past\nthe ~%s s after which firmware watchdogs have RESET machines mid-\nunlock on some hardware. Consider fewer iterations.\n' "$BT_GRUB_RESET_WALL_S"
+     else
+       printf '\n'
+     fi
+   fi )
 
 What that buys, against 1000 GPUs with 24 GiB each, all guessing
 (years to search half the keyspace, and what has happened by then):
