@@ -34,7 +34,7 @@
 # ============================================================================
 set -uo pipefail
 
-LL_VERSION="1.4.2"
+LL_VERSION="1.4.3"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REDACT=1
 OUTFILE=""
