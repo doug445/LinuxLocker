@@ -185,7 +185,11 @@ has that much slack). Full matrix and workarounds:
 
 Three presets. All argon2id; there is deliberately no pbkdf2 profile, and the
 `fast` profile is a **hard floor** — the tool refuses to write anything
-cheaper, with no override flag.
+cheaper, with no override flag. **LinuxLocker hardens; it never weakens.** It
+does not write a KDF below the floor, and `luks-tune.sh` does not re-cost a
+keyslot to anything cheaper than the keyslot already has. If you genuinely
+want a weaker keyslot, that is a manual `cryptsetup luksConvertKey` you run
+yourself, outside this tool — no script here will do it for you.
 
 | Profile | Memory | Iterations | Unlock time* | argon2id CPU-seconds |
 |---|---|---|---|---|
@@ -669,7 +673,7 @@ recovery bundle are key material, not diagnostics.
 
 MIT — see [LICENSE](LICENSE).
 
-- **Version:** 1.4.0
+- **Version:** 1.4.1
 - **Author:** William MacKinnon ([doug445](https://github.com/doug445))
 - **Email:** spilled-bowline0j@icloud.com
 - **Repository:** https://github.com/doug445/LinuxLocker
