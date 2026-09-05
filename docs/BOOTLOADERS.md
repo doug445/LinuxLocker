@@ -243,21 +243,24 @@ A target whose `/boot` lives on the root filesystem under GRUB or extlinux —
 Debian, Ubuntu and openSUSE defaults often do this; Fedora always has a separate
 `/boot` — is refused **before the shrink**, with nothing changed. Encrypting it
 would put the kernel, the initramfs and `grub.cfg` inside the container, so the
-bootloader itself would have to open the volume before it could load anything:
+bootloader itself would have to open the volume before it could load anything
+— and the keyslot it opens would be the weakest way into the machine:
 
-- GRUB runs the KDF single-threaded with no SIMD, about **8.5× slower** than the
-  initramfs for the same argon2id parameters (measured: 2.0 s per GiB-pass in
-  GRUB 2.14 against 9.5 s for 40 GiB-passes in the initramfs);
-- argon2id needs its whole memory cost as **one contiguous allocation**, and
-  GRUB takes it from the firmware heap. On x86 UEFI that has never reliably
-  meant more than **1 GiB**; 4 GiB overflows GRUB's 32-bit block count on every
-  platform. 2 GiB has been shown to work only under U-Boot's EFI on Apple
-  Silicon, which is AsahiLocker's territory;
-- the GRUB image on the ESP has to be re-embedded with the crypto modules by
-  `grub-install`, and whether it can open argon2id at all depends on the build:
-  stock GRUB 2.12 prints *Argon2 not supported*, GRUB 2.14 embeds `argon2.mod`;
-- long uninterrupted compute inside GRUB has tripped a firmware watchdog and
-  reset the machine past roughly 40 s on some hardware;
+- argon2id's strength is its memory cost, and it needs that memory as **one
+  contiguous allocation**. GRUB takes it from the firmware heap, which on x86
+  UEFI has never reliably meant more than **1 GiB**; 4 GiB overflows GRUB's
+  32-bit block count on every platform. A root keyslot at 4 GiB holds a 24 GB
+  GPU to ~6 guesses at once; a `/boot` keyslot at 1 GiB lets it run ~24. (2 GiB
+  has been shown to work only under U-Boot's EFI on Apple Silicon, which is
+  AsahiLocker's territory);
+- whether GRUB can open argon2id at all depends on the build: stock GRUB 2.12
+  prints *Argon2 not supported*, GRUB 2.14 embeds `argon2.mod`; and the image
+  on the ESP has to be re-embedded with the crypto modules by `grub-install`;
+- GRUB runs the KDF single-threaded with no SIMD, about 8.5× the initramfs time
+  for the same parameters (measured: 2.0 s per GiB-pass in GRUB 2.14 against
+  9.5 s for 40 GiB-passes in the initramfs), and long uninterrupted compute in
+  GRUB has tripped a firmware watchdog past roughly 40 s on some hardware — so
+  the cost cannot even be bought back with iterations;
 - extlinux / U-Boot cannot read LUKS in any form.
 
 The old behaviour encrypted such a target and reported success on a machine
@@ -292,10 +295,11 @@ self-built 2.14 image with argon2 embedded. Note that Fedora's signed GRUB
 carries `cryptomount` and `luks2` even with an unencrypted `/boot`, which is why
 the volume's UUID — not the presence of cryptodisk — is what proves "unlocks".
 
-On a recognised volume, `luks-tune.sh` and the LUKS1 conversion offer only the
-1 GiB profile (or a custom cost within the ceiling), show every unlock estimate
-multiplied by GRUB's slowdown, and warn when the result crosses the watchdog
-line. `LUKS_GRUB_KDF_FACTOR` overrides the multiplier;
+On a recognised volume, `luks-tune.sh` and the LUKS1 conversion still put the
+strongest KDF GRUB can open on it: argon2id at the 1 GiB profile (or a custom
+cost within the ceiling), with the unlock estimate stated for where it actually
+runs — multiplied by GRUB's slowdown — and a warning when the result crosses
+the watchdog line. `LUKS_GRUB_KDF_FACTOR` overrides the multiplier;
 `LUKS_GRUB_ARGON2_MAX_KIB` raises the ceiling **only** for a machine on which a
 larger allocation has been measured to succeed inside GRUB. pbkdf2 is never
 written, so a GRUB without argon2 is told so and the volume is left as it is.
