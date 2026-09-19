@@ -739,6 +739,7 @@ turns the same information into a one-line-per-volume fastfetch readout.
 | Doc | Covers |
 |-----|--------|
 | [ABOUT.md](docs/ABOUT.md) | What the project is, who it is for, what it deliberately does not do |
+| [TESTED-SYSTEMS.md](docs/TESTED-SYSTEMS.md) | The machines behind the ✅ claims — hardware, layout, what was verified |
 | [INSTALL.md](docs/INSTALL.md) | Step-by-step install, start to finish, with what each prompt means |
 | [FILESYSTEMS.md](docs/FILESYSTEMS.md) | Every filesystem classified: shrinkable in place, slack-only, or not at all — with workarounds |
 | [RECOVERY.md](docs/RECOVERY.md) | Interrupted encryption, unbootable system, corrupt header, undoing a shrink |
