@@ -253,6 +253,49 @@ The `aggressive` profile needs ~6 GiB of free RAM at every unlock — the
 installer warns on small-memory machines (Raspberry Pi class) and refuses any
 profile whose memory cost exceeds the machine's RAM outright.
 
+### The case for `aggressive` — and for `paranoid` after it
+
+Pick `aggressive` unless you have a reason not to. Here is the reason to.
+
+**You pay the KDF once per boot. The attacker pays it once per guess.** An
+unlock is not a screen unlock or a wake from sleep — it is the passphrase
+prompt at power-on, and nothing else. On the reference ZenBook `aggressive`
+costs ~16 s there; boot once a day and that is about an hour and a half a
+year, and the disk runs at full AES-XTS speed (2.2 GB/s on that machine) for
+every second in between, because argon2id never runs again until the next
+boot. An attacker with an image of your disk pays those same seconds — on
+their hardware, at their scale — for every single guess, and against a 40-bit
+human-chosen passphrase they need about a trillion of them. That asymmetry is
+the whole product, and `aggressive` is where it is steepest: **14× the work of
+a stock `luksFormat`** on that machine (727 MiB × 4, tuned to two seconds),
+2.5× `moderate`, 4.4× `fast`. Against a thousand-GPU fleet that is the
+difference between roughly **28 years** and, for stock, about two.
+
+**4 GiB is the ceiling, and `aggressive` sits on it.** Memory is the only thing
+that makes an attacker's silicon expensive — a 24 GB GPU fits about six
+concurrent 4 GiB guesses, twelve at 2 GiB, twenty-four at 1 GiB, thousands
+against a memory-free loop like BitLocker's or FileVault's. `cryptsetup`
+refuses argon2id memory above 4 GiB, so no setting anywhere makes a guess
+dearer in memory than `aggressive` already does. Every profile below it hands
+the attacker back some of that parallelism for a few seconds of your boot.
+
+**`paranoid` is the last 20 %.** Past the memory ceiling only time raises the
+price, and `paranoid` (4 GiB × 12) raises it 20 % on every guess, forever, for
+about three more seconds per boot on that machine. It is not in the deploy
+menu on purpose — it is a decision to make after the fact, with
+`luks-tune.sh`, once you have lived with `aggressive` and found the wait
+invisible. Most people do.
+
+**Who this is for.** A laptop that leaves the house. A passphrase you chose
+yourself rather than rolled with dice — the rows where the KDF, not the
+passphrase, decides the outcome. Anyone who will never come back to re-cost
+the keyslot: the KDF you ship is the KDF the thief meets, and it costs nothing
+to make it the strongest one available. Above six diceware words every tier
+is past cosmic time and the choice stops mattering; below that it is the
+largest single security factor you control with one menu keystroke. The one
+machine that should not run it is one with less than ~6 GiB free at unlock —
+the installer says so before it lets you pick.
+
 Already encrypted? `sudo ./bin/luks-tune.sh` (or `linuxlocker.sh tune`) is an
 ncurses UI that re-costs existing keyslots — shows the measured unlock time
 and what each cost buys against a GPU fleet, backs the header up first, and
