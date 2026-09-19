@@ -306,6 +306,42 @@ or re-embeds a GRUB image.
 - **Resilience**: `checksum` — the in-place re-encryption is journaled, so
   power loss mid-run is recoverable by re-running the script.
 
+### How this compares with BitLocker and FileVault — the KDF the other OS on your disk uses
+
+Most machines LinuxLocker runs on share a disk with Windows or macOS, so the
+comparison is not academic: the same passphrase habits, the same drive, three
+key-derivation designs. They differ in kind, and it pays to be exact about
+which is stronger at what.
+
+| | BitLocker (Windows) | FileVault (macOS) | LinuxLocker (LUKS2) |
+|---|---|---|---|
+| Key derivation | **None, by default.** TPM-only mode releases the volume key when the boot measurements match — no passphrase is ever stretched. With a PIN, the TPM's anti-hammering carries it. Password mode (no TPM) and the recovery path stretch with a chained **SHA-256** (2^20 rounds, as the tools that open BitLocker volumes on Linux implement it) — a loop with no memory cost | **PBKDF2** with SHA-256 — a loop, the year-2000 design, no memory cost; 41,000 iterations documented for the CoreStorage era (Choudary, Grobert and Metz, *Infiltrate the Vault*, 2012), no figure published since | **argon2id** (RFC 9106, the Password Hashing Competition winner): **1–4 GiB of memory per guess**, 8–10 passes, sha512 throughout — the profiles above, benchmarked on the machine being encrypted |
+| Where the secret is stretched | Inside the TPM (measurement, PIN throttling) — or nowhere | Inside the Secure Enclave on T2 and Apple Silicon Macs, entangled with the chip's UID and throttled there; on the CPU, offline-attackable, on Intel Macs without a T2 | In the initramfs, on the CPU, from the disk alone |
+| An attacker with the disk alone | TPM modes: cannot start without the TPM. Password mode: the SHA-256 chain is all that stands in the way, on hardware of the attacker's choosing | T2 / Apple Silicon: cannot start without that Secure Enclave. Pre-T2 Intel: PBKDF2 alone, offline | Can start at once: the LUKS header holds everything, and each guess costs argon2id's full memory-bound work — the only defence, and a real one |
+| An attacker with the machine | The famous case: the key crosses a bus. Discrete TPMs have had their key sniffed off the SPI/LPC bus in minutes; TPM-only mode then hands over the disk with no passphrase ever typed | Secure Enclave throttling; behind it a PBKDF2 a GPU would eat in days if it ever ran offline | Exactly the disk-alone case: the machine adds nothing and takes nothing away |
+| What carries a weak passphrase | Hardware — or, in TPM-only mode, there is no passphrase to carry | Hardware, on the Macs that have it | Nothing. LinuxLocker enrols no TPM by design ([FAQ](#can-it-unlock-with-a-tpm-or-with-no-passphrase-at-all)), so the KDF's cost per guess and your passphrase are the whole wall |
+| What carries a strong passphrase | Both, where a passphrase exists at all | Both | The passphrase — past six diceware words every column of `luks-tune.sh`'s strength readout reads *past the age of the universe*; the KDF decides the short-passphrase rows, not those |
+| If the hardware promise fails | A sniffed bus, a firmware measurement that matches when it should not, a vendor key: back to a memory-free hash, or to nothing | A Secure Enclave flaw or a vendor order: back to PBKDF2, offline | Nothing to fall back from — the design never rested on hardware, and it is the same wall on every machine, today and after this one is replaced |
+
+Said plainly: **as a key-derivation function, LinuxLocker's argon2id exceeds
+BitLocker's SHA-256 chain and FileVault's PBKDF2 by orders of magnitude**, for
+one reason — memory. Both of those are loops that ask a graphics card for
+nothing but arithmetic; argon2id at 4 GiB lets a 24 GB card run about six
+guesses at once. Against a 40-bit human-chosen password and a thousand-GPU
+fleet, that is the difference between roughly **28 years** and **ten days**;
+against six diceware words both are past cosmic time and the passphrase is
+what saves you (the model and the full table are in
+[AsahiLocker's README](https://github.com/doug445/AsahiLocker#your-passphrase-is-the-other-half),
+same tool family, same numbers; `luks-tune.sh` prints your own volume's
+figures with the same cosmic-era anchors). Microsoft and Apple know their
+functions are weak and do not rely on them: they rely on a TPM or a Secure
+Enclave to keep the weak function out of an attacker's reach. That is a
+legitimate design with a single point of trust that is not yours, and one
+that has failed in public more than once. LinuxLocker takes the other road:
+make every guess genuinely expensive on any silicon, and let the passphrase do
+the rest — which is why the passphrase advice here is not decoration. Under
+Linux it is the TPM you chose not to trust.
+
 ## Environment knobs (fleet / non-interactive use)
 
 ```
@@ -444,7 +480,9 @@ argon2id is memory-hard, so an attacker has to buy RAM per guess, not just
 cores. All three profiles are argon2id, and the cheapest of them is a hard
 floor with no override flag — the tool exists to beat a bare `luksFormat`, not
 to undercut it. `luks-tune.sh` also converts leftover pbkdf2 keyslots on
-volumes you encrypted earlier.
+volumes you encrypted earlier. For what the same loop looks like in BitLocker
+and FileVault, and what those rely on instead, see
+[How this compares with BitLocker and FileVault](#how-this-compares-with-bitlocker-and-filevault--the-kdf-the-other-os-on-your-disk-uses).
 
 ### Why is `/boot` left unencrypted?
 
@@ -571,7 +609,9 @@ on this disk, and the disk does not need to wait for them.
 No. LinuxLocker enrolls a passphrase and, optionally, a recovery keyslot. TPM2
 enrollment, PCR sealing and network-bound unlock are features it does not
 implement — you type the passphrase at boot. Secure Boot signing (above) is a
-separate thing and *is* handled.
+separate thing and *is* handled. What a TPM buys BitLocker, what it costs, and
+what stands in for it here:
+[How this compares with BitLocker and FileVault](#how-this-compares-with-bitlocker-and-filevault--the-kdf-the-other-os-on-your-disk-uses).
 
 ### I run Fedora Asahi Remix on an Apple Silicon Mac. Can I use this?
 
