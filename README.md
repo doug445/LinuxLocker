@@ -346,6 +346,20 @@ or re-embeds a GRUB image.
 - **KDF**: argon2id, pinned per profile (`--pbkdf-force-iterations`, no
   time-benchmark drift between fleet machines).
 - **Hash**: sha512 (AF splitter + LUKS2 digest).
+- **Encryption sector**: the filesystem's block size — **4096 bytes** for
+  ext4, btrfs, xfs and f2fs (512 for ntfs and vfat). cryptsetup's default of
+  512 made every 4096-byte filesystem block eight XTS blocks with eight IVs.
+  cryptsetup refuses 4096-byte sectors on a partition whose size is not a
+  multiple of 4096 — and on a 512-byte-sector GPT disk the last partition never
+  is, because GPT reserves 33 sectors at the end of the disk; that is every
+  installer-made root partition. The script then asks: type `ALIGN` to move
+  the partition's end down by those few bytes (the table is backed up first;
+  type, name, GUID and attributes kept; the filesystem, already 32 MiB
+  smaller, loses nothing), or press Enter for 512-byte sectors.
+  `LUKS_ALIGN_PARTITION=yes|no` answers it non-interactively;
+  `LUKS_SECTOR_SIZE=512` pins the old value. Volumes made by earlier releases
+  keep their 512-byte sectors — as secure, just slower; `luks-tune.sh` shows
+  which you have.
 - **Resilience**: `checksum` — the in-place re-encryption is journaled, so
   power loss mid-run is recoverable by re-running the script.
 
@@ -395,6 +409,8 @@ LUKS_PASSPHRASE_FILE=<path>                non-interactive passphrase
 LUKS_RECOVERY_KEY=yes|no                   recovery keyslot without prompting
 LUKS_MAPPER_NAME=<name>                    device-mapper name (default root_crypt)
 LUKS_KEEP_SPLASH=1                         don't strip rhgb/quiet/splash
+LUKS_SECTOR_SIZE=512|1024|2048|4096       encryption sector (default: the fs block size)
+LUKS_ALIGN_PARTITION=yes|no                move the partition end to a 4096-byte multiple, or keep 512-byte sectors
 LUKS_DRY_RUN=1  (or --dry-run)             plan only, change nothing
 LUKS_SKIP_VERSION_CHECK=1                  bypass the cryptsetup >= 2.4 floor
 LUKS_ALLOW_UKI=1                           proceed past the two UKI refusals
@@ -804,7 +820,7 @@ author's, the audit checked that the code keeps them.
 
 MIT — see [LICENSE](LICENSE).
 
-- **Version:** 1.5.2
+- **Version:** 1.6.0
 - **Author:** William MacKinnon ([doug445](https://github.com/doug445))
 - **Email:** spilled-bowline0j@icloud.com
 - **Repository:** https://github.com/doug445/LinuxLocker

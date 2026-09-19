@@ -73,7 +73,7 @@ cleanup() {
     umount "$WORK/mnt" 2>/dev/null
     cryptsetup close "$MAP1" 2>/dev/null
     cryptsetup close "$MAP2" 2>/dev/null
-    for l in "$LOOP1" "$LOOP2" "$LOOP3" "$LOOP4" "$LOOP5"; do
+    for l in "$LOOP1" "$LOOP2" "$LOOP3" "$LOOP4" "$LOOP5" ${LOOPS_EXTRA:-}; do
         [ -n "$l" ] && losetup -d "$l" 2>/dev/null
     done
     rm -rf "$WORK"
@@ -334,6 +334,82 @@ AF5=$(cryptsetup luksDump "$LOOP5" | awk '/^[[:space:]]+AF hash:/{print $3; exit
     && pass "re-costed slot carries AF hash sha512 (--hash pinned)" \
     || fail "re-costed slot AF hash is '$AF5'"
 assert_unlocks "$LOOP5" "$MAP2" "converted LUKS1→LUKS2 volume"
+
+echo "== 9. 4096-byte encryption sectors: a 4Kn device and a 512-byte one =="
+# Every filesystem here writes 4096-byte blocks; luks-deploy passes
+# --sector-size 4096 whenever the block size allows it. Both device geometries
+# must take it in place, and the content must survive.
+for LSS in 4096 512; do
+    IMG="$WORK/disk-ss$LSS.img"; truncate -s 600M "$IMG"
+    if ! L9=$(losetup --show -f --sector-size "$LSS" "$IMG" 2>/dev/null); then
+        echo "  SKIP: losetup --sector-size $LSS unsupported here"; continue
+    fi
+    LOOPS_EXTRA="${LOOPS_EXTRA:-} $L9"
+    mkfs.btrfs -q -f "$L9"; mount "$L9" "$WORK/mnt"; echo "ss-sentinel-$LSS" > "$WORK/mnt/f"
+    btrfs -q filesystem resize -32M "$WORK/mnt"; umount "$WORK/mnt"
+    if cryptsetup reencrypt --encrypt --type luks2 "${KDF[@]}" --cipher aes-xts-plain64 --key-size 512 --hash sha512 --sector-size 4096 \
+           --reduce-device-size 32M --resilience checksum --key-file "$WORK/pass" --batch-mode -q "$L9"; then
+        pass "reencrypt --encrypt --sector-size 4096 on a $LSS-byte device"
+    else
+        fail "reencrypt --sector-size 4096 refused on a $LSS-byte device"; continue
+    fi
+    cryptsetup open --key-file "$WORK/pass" "$L9" "$MAP2"
+    [ "$(cryptsetup status "$MAP2" | awk '/sector size:/{print $3; exit}')" = 4096 ] && pass "container encrypts in 4096-byte sectors ($LSS-byte device)" || fail "sector size wrong"
+    mount "/dev/mapper/$MAP2" "$WORK/mnt" && grep -q "ss-sentinel-$LSS" "$WORK/mnt/f" && pass "content intact through 4096-byte-sector encryption" || fail "content lost"
+    umount "$WORK/mnt" 2>/dev/null; cryptsetup close "$MAP2"
+done
+
+echo "== 10. the last partition of a 512-byte-sector GPT disk: 33 sectors short, aligned, encrypted in 4096-byte sectors =="
+# GPT reserves 33 sectors at the end of the disk, so an installer's rest-of-the-
+# disk root partition never has a size that is a multiple of 4096 — and
+# cryptsetup refuses --sector-size 4096 on it. luks-deploy's align_partition_end
+# moves the end down by the remainder after the shrink; it is run here exactly
+# as the script defines it (sed markers), against a real GPT loop image.
+IMG10="$WORK/gpt.img"; truncate -s 320M "$IMG10"
+sgdisk -n 1:2048:0 -t 1:8300 -c 1:root "$IMG10" >/dev/null 2>&1
+if L10=$(losetup --show -f --partscan "$IMG10" 2>/dev/null) && sleep 1 && [ -b "${L10}p1" ]; then
+    LOOPS_EXTRA="${LOOPS_EXTRA:-} $L10"
+    SZ=$(blockdev --getsize64 "${L10}p1")
+    [ $((SZ % 4096)) -ne 0 ] && pass "the rest-of-the-disk partition is $((SZ % 4096)) bytes past a 4096-byte multiple (GPT's reserved tail)" || fail "partition size unexpectedly aligned ($SZ)"
+    # -b 4096: mkfs.ext4 gives a filesystem this small 1024-byte blocks, and
+    # cryptsetup refuses --sector-size 4096 against an ext4 superblock with
+    # smaller blocks ("incompatible with ext4 superblock") — which is exactly
+    # why luks-deploy reads the block size (fs_block_size) before choosing.
+    # A real root filesystem (>= 512 MiB) gets 4096-byte blocks by default.
+    mkfs.ext4 -q -F -b 4096 "${L10}p1"; mount "${L10}p1" "$WORK/mnt"; echo "align-sentinel" > "$WORK/mnt/f"; umount "$WORK/mnt"
+    BS10=$(dumpe2fs -h "${L10}p1" 2>/dev/null | awk -F': *' '/^Block size:/{print $2; exit}')
+    [ "$BS10" = 4096 ] && pass "ext4 block size 4096 (the size the sector must not exceed)" || fail "ext4 block size $BS10"
+    e2fsck -f -p "${L10}p1" >/dev/null; resize2fs "${L10}p1" "$(( ($(ext4_bytes "${L10}p1") - 32*1024*1024) / 1024 ))K" >/dev/null 2>&1
+    ALIGN_FN=$(sed -n '/^# --- align_partition_end ---/,/^# --- end align_partition_end ---/p' "$(dirname "$0")/../bin/luks-deploy.sh")
+    [ -n "$ALIGN_FN" ] || fail "align_partition_end not found in luks-deploy.sh"
+    ( set -e; log() { :; }; warn() { echo "  WARN $*"; }; fatal() { echo "  FATAL $*"; exit 1; }
+      fs_bytes() { ext4_bytes "$1"; }
+      # the eval'd function reads these (shellcheck cannot see that)
+      # shellcheck disable=SC2034
+      STATE_DIR="$WORK"
+      # shellcheck disable=SC2034
+      TARGET_ROOT="${L10}p1"
+      # shellcheck disable=SC2034
+      ORIG_FSTYPE=ext4
+      # shellcheck disable=SC2034
+      LUKS_SECTOR_SIZE=4096
+      eval "$ALIGN_FN"; align_partition_end ) && pass "align_partition_end ran (table backed up to $WORK/gpt-backup-*.bin)" || fail "align_partition_end failed"
+    SZ2=$(blockdev --getsize64 "${L10}p1")
+    [ $((SZ2 % 4096)) -eq 0 ] && [ $((SZ - SZ2)) -lt 4096 ] && pass "partition now $SZ2 bytes: a 4096-byte multiple, $((SZ - SZ2)) bytes shorter" || fail "partition after alignment: $SZ2 (was $SZ)"
+    N10=$(sgdisk -i 1 "$L10" | sed -n "s/^Partition name: '\(.*\)'\$/\1/p")
+    [ "$N10" = root ] && pass "partition name kept ($N10)" || fail "partition name changed: '$N10'"
+    if cryptsetup reencrypt --encrypt --type luks2 "${KDF[@]}" --cipher aes-xts-plain64 --key-size 512 --hash sha512 --sector-size 4096 \
+           --reduce-device-size 32M --resilience checksum --key-file "$WORK/pass" --batch-mode -q "${L10}p1"; then
+        pass "reencrypt --encrypt --sector-size 4096 on the aligned ext4 partition"
+        cryptsetup open --key-file "$WORK/pass" "${L10}p1" "$MAP2"
+        mount "/dev/mapper/$MAP2" "$WORK/mnt" && grep -q align-sentinel "$WORK/mnt/f" && pass "ext4 content intact after alignment + encryption" || fail "content lost"
+        umount "$WORK/mnt" 2>/dev/null; cryptsetup close "$MAP2"
+    else
+        fail "reencrypt still refused after alignment"
+    fi
+else
+    echo "  SKIP: cannot create a partitioned loop device here"
+fi
 
 echo ""
 echo "==================================================="
