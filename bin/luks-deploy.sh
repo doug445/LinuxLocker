@@ -124,6 +124,25 @@ warn() { echo -e "[$(date '+%H:%M:%S')] ${YELLOW}[WARN]${NC} $*"; }
 err()  { echo -e "[$(date '+%H:%M:%S')] ${RED}[ERROR]${NC} $*" >&2; }
 fatal() { err "$@"; exit 1; }
 
+# ask <VAR> <ENV> <prompt> — read an answer into VAR. $ENV, when set, answers
+# the prompt without a terminal and is logged as having done so. With neither
+# a value nor a terminal the run stops and names the variable, instead of
+# dying on a failed read with no message at all.
+ask() {
+    local __var="$1" __env="$2" __prompt="$3" __shown
+    if [ -n "${!__env:-}" ]; then
+        printf -v "$__var" '%s' "${!__env}"
+        __shown="${__prompt#"${__prompt%%[![:space:]]*}"}"
+        log "  $__env=${!__env} answers: ${__shown% }"
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        fatal "No terminal to answer '${__prompt#"${__prompt%%[![:space:]]*}"}' — set $__env (see the header of this script)."
+    fi
+    # shellcheck disable=SC2229  # read into the caller's variable, by name
+    read -r -p "$__prompt" "$__var"
+}
+
 # ─── Shared dependency helpers (OS / package manager / installer) ────────────
 # Optional: if lib-deps.sh sits next to this script, missing filesystem tools
 # are auto-installed with the live distro's package manager; without it they
@@ -277,6 +296,37 @@ harden_path() {                        # harden_path <octal-mode> <path>
 #                                8.5, measured on one machine; see lib-boot.sh
 #   LUKS_GRUB_ARGON2_MAX_KIB=<n> argon2id memory ceiling for such a volume.
 #                                Default 1 GiB — the x86 UEFI contiguous heap
+#
+# Every remaining prompt has a pin as well, so a run with no terminal never
+# hangs on a read or dies on one without a message: a prompt with neither a
+# pin nor a terminal stops the run and names the variable it wanted. The
+# typed-word gates take the same word a person would type, never a bare 1, so
+# a stray 'yes' cannot open them.
+#   LUKS_CONFIRM=ENCRYPT|CONFIGURE|CONVERT
+#                                the point-of-no-return gate of the mode the run
+#                                actually reaches; a mismatch is fatal, so a
+#                                pinned ENCRYPT can never reconfigure or convert
+#   LUKS_STALE_MAPPER=keep|close a /dev/mapper/<name> left open by an earlier run
+#   LUKS_LIVE_OVERRIDE=LIVE      run from a root that is not a live environment
+#   LUKS_BATTERY_OVERRIDE=BATTERY  run on battery below 50%
+#   LUKS_UNMOUNT=yes|no          unmount the target if a live desktop mounted it
+#   LUKS_RESUME=yes|no           finish an interrupted encryption
+#   LUKS_EXISTING=tune|config|quit  what to do with a finished LUKS2 volume
+#   LUKS_PROFILE=...|skip        also answers the re-costing menu after a LUKS1
+#                                conversion; 'skip' leaves the keyslots on pbkdf2
+#                                and is only meaningful there
+#   LUKS_DATA_PARTITION=yes|no   encrypt a volume with no /etc/fstab as data
+#   LUKS_MISMATCH_OVERRIDE=MISMATCH
+#                                keep a pinned /boot or EFI partition that the
+#                                target's fstab disagrees with
+#   LUKS_CROSS_DISK=yes|no       proceed with /boot or EFI on another disk
+#   LUKS_SUBVOL_MISMATCH=yes|no  proceed when BLS and fstab name different subvolumes
+#   LUKS_FSCK=yes|no             run the read-only integrity check first
+#   LUKS_FSCK_FORCE=FORCE        continue past filesystem errors
+#   LUKS_ALREADY_SHRUNK=yes|no   f2fs/vfat only: was the filesystem shrunk by an
+#                                earlier, interrupted run?
+# The one prompt without a pin is the inner-UUID-changed override: that state
+# means the wrong device is open, and no fleet should answer it blind.
 #
 # Encrypted /boot is RECOGNISED, never set up. A target whose /boot lives on
 # the root filesystem under GRUB or extlinux is refused before the shrink: the
@@ -688,7 +738,7 @@ cleanup() {
     umount /mnt 2>/dev/null || true
     cryptsetup close ${LUKS_NAME} 2>/dev/null || true
     cryptsetup close "luks-probe-$$" 2>/dev/null || true
-    rm -f /mnt/tmp/.luks-deploy-env /mnt/tmp/.luks-lib-uki.sh /mnt/tmp/.luks-lib-boot.sh 2>/dev/null || true
+    rm -f /mnt/tmp/.luks-deploy-env /mnt/tmp/.luks-chroot.sh /mnt/tmp/.luks-lib-uki.sh /mnt/tmp/.luks-lib-boot.sh 2>/dev/null || true
     if [ $exit_code -ne 0 ]; then
         echo ""
         echo "Recovery options:"
@@ -722,7 +772,7 @@ if [ -b /dev/mapper/${LUKS_NAME} ]; then
     warn "Found /dev/mapper/${LUKS_NAME} already open from a previous run!"
     echo "  keep  = leave it open and reuse it (saves a passphrase prompt in config-only mode)"
     echo "  close = close it and start fresh"
-    read -p "Keep or close? (keep/close): " STALE_CHOICE
+    ask STALE_CHOICE LUKS_STALE_MAPPER "Keep or close? (keep/close): "
     umount -R /mnt 2>/dev/null || true
     case "$STALE_CHOICE" in
         keep)
@@ -798,7 +848,7 @@ case "$CURRENT_ROOT_FSTYPE" in
         err "This script MUST be run from a LIVE USB / rescue environment."
         err "Running on the installed system WILL destroy your data."
         echo ""
-        read -p "Are you certain you are in a live/rescue environment? (Type 'LIVE' to override): " LIVE_OVERRIDE
+        ask LIVE_OVERRIDE LUKS_LIVE_OVERRIDE "Are you certain you are in a live/rescue environment? (Type 'LIVE' to override): "
         [ "$LIVE_OVERRIDE" = "LIVE" ] || fatal "Aborted for safety."
         ;;
 esac
@@ -822,7 +872,7 @@ for ps_dir in /sys/class/power_supply/*/; do
             err "║  Connect AC power before proceeding.                ║"
             err "╚══════════════════════════════════════════════════════╝"
             echo ""
-            read -p "Continue on battery? (Type 'BATTERY' to override): " BAT_OVERRIDE
+            ask BAT_OVERRIDE LUKS_BATTERY_OVERRIDE "Continue on battery? (Type 'BATTERY' to override): "
             [ "$BAT_OVERRIDE" = "BATTERY" ] || fatal "Connect AC power and try again."
         fi
         break
@@ -851,6 +901,8 @@ pick_partition() {
     # All display/prompts go to stderr so stdout is clean for capture.
     local role="$1" fstype="$2" label_hint="$3"
     local -a devs=() disp_labels=() sizes=() disks=() scores=()
+    # A menu needs a terminal; a fleet run pins the answer instead.
+    [ -t 0 ] || fatal "No terminal to pick the $role partition — pin it with LUKS_TARGET_ROOT / LUKS_TARGET_BOOT / LUKS_TARGET_EFI."
     local idx=0 best_idx=0 best_score=-999
 
     # Collect all partitions matching fstype (skip loop devices).
@@ -1021,7 +1073,7 @@ ensure_unmounted() {
         warn "  [dry-run] a real run would require unmounting these first."
         return 0
     fi
-    read -p "  Unmount it now? (yes/no): " UNMOUNT_OK
+    ask UNMOUNT_OK LUKS_UNMOUNT "  Unmount it now? (yes/no): "
     [ "$UNMOUNT_OK" = "yes" ] || fatal "Cannot operate on a mounted device."
     while IFS= read -r mp; do
         [ -n "$mp" ] || continue
@@ -1177,7 +1229,7 @@ convert_luks1() {
         log "[dry-run] Nothing was changed."
         exit 0
     fi
-    read -p "  Type 'CONVERT' to convert this LUKS1 header to LUKS2: " CONFIRM_CONV
+    ask CONFIRM_CONV LUKS_CONFIRM "  Type 'CONVERT' to convert this LUKS1 header to LUKS2: "
     [ "$CONFIRM_CONV" = "CONVERT" ] || fatal "Aborted — header unchanged."
 
     # Close any mapper currently backed by this device; convert needs it inactive.
@@ -1206,6 +1258,24 @@ convert_luks1() {
     log "  Header converted to LUKS2."
 
     # ── Re-cost the keyslots to argon2id ────────────────────────────────────
+    # LUKS_PROFILE answers this menu too (aggressive|moderate|fast|skip); the
+    # menu for a GRUB-unlocked volume takes fast or skip. A pinned value the
+    # menu does not offer is fatal, never mapped to a default nobody chose.
+    convert_menu_choice() {   # $1 = variable, $2 = prompt
+        if [ -n "${LUKS_PROFILE:-}" ]; then
+            case "$LUKS_PROFILE" in
+                aggressive) printf -v "$1" 1 ;;
+                moderate)   printf -v "$1" 2 ;;
+                fast)       printf -v "$1" 3 ;;
+                skip)       printf -v "$1" 4 ;;
+                *) fatal "Unknown LUKS_PROFILE '$LUKS_PROFILE' (expected: aggressive, moderate, fast, or skip)" ;;
+            esac
+            log "  LUKS_PROFILE=$LUKS_PROFILE answers the re-costing menu."
+            return 0
+        fi
+        [ -t 0 ] || fatal "No terminal to answer the re-costing menu — set LUKS_PROFILE (aggressive|moderate|fast|skip)."
+        read -r -p "$2" "$1"
+    }
     profile=skip
     if [ "$GRUB_RECOST" = "none" ]; then
         echo ""
@@ -1236,11 +1306,14 @@ convert_luks1() {
             fi
             echo ""
             while true; do
-                read -p "  Select [3-4, default 4=skip]: " KDF_CHOICE
+                convert_menu_choice KDF_CHOICE "  Select [3-4, default 4=skip]: "
                 case "${KDF_CHOICE:-4}" in
                     3) profile=fast; apply_kdf_profile fast; break ;;
                     4) profile=skip; break ;;
-                    *) echo "  Invalid selection '$KDF_CHOICE' — enter 3 or 4." ;;
+                    *)
+                        [ -z "${LUKS_PROFILE:-}" ] \
+                            || fatal "LUKS_PROFILE=$LUKS_PROFILE is not offered on a volume GRUB unlocks (fast or skip). Keyslots unchanged."
+                        echo "  Invalid selection '$KDF_CHOICE' — enter 3 or 4." ;;
                 esac
             done
         else
@@ -1255,7 +1328,7 @@ convert_luks1() {
             fi
             echo ""
             while true; do
-                read -p "  Select [1-4, default 2=moderate]: " KDF_CHOICE
+                convert_menu_choice KDF_CHOICE "  Select [1-4, default 2=moderate]: "
                 case "${KDF_CHOICE:-2}" in
                     1) profile=aggressive; apply_kdf_profile aggressive ;;
                     2) profile=moderate;   apply_kdf_profile moderate ;;
@@ -1266,6 +1339,8 @@ convert_luks1() {
                 # The KDF re-runs at every boot on THIS machine; it must fit.
                 if [ "$MEM_TOTAL_KIB" -gt 0 ] && [ "$LUKS_PBKDF_MEMORY" -ge "$MEM_TOTAL_KIB" ]; then
                     warn "  $profile needs $((LUKS_PBKDF_MEMORY / 1024)) MiB; this machine has $((MEM_TOTAL_KIB / 1024)) MiB. Pick a smaller profile."
+                    [ -z "${LUKS_PROFILE:-}" ] \
+                        || fatal "LUKS_PROFILE=$LUKS_PROFILE does not fit this machine's RAM. Keyslots unchanged."
                     continue
                 fi
                 break
@@ -1344,7 +1419,7 @@ if blkid "$TARGET_ROOT" | grep -q 'TYPE="crypto_LUKS"'; then
         echo "  (reencrypt --resume-only) and then redo the configuration"
         echo "  phase. This script can do both now."
         echo ""
-        read -p "  Resume the interrupted encryption now? (yes/no): " RESUME_OK
+        ask RESUME_OK LUKS_RESUME "  Resume the interrupted encryption now? (yes/no): "
         [ "$RESUME_OK" = "yes" ] \
             || fatal "Aborted. Resume manually with: cryptsetup reencrypt --resume-only $TARGET_ROOT"
         DEPLOY_MODE="resume"
@@ -1377,9 +1452,9 @@ if blkid "$TARGET_ROOT" | grep -q 'TYPE="crypto_LUKS"'; then
         echo "   3) quit    — leave everything exactly as it is"
         echo ""
         while true; do
-            read -p "  Select [1-3, default 3=quit]: " LUKS2_CHOICE
+            ask LUKS2_CHOICE LUKS_EXISTING "  Select [1-3, default 3=quit]: "
             case "${LUKS2_CHOICE:-3}" in
-                1)
+                1|tune)
                     log "Launching the KDF tuning UI..."
                     [ -x "$SCRIPT_DIR/luks-tune.sh" ] \
                         || fatal "luks-tune.sh not found next to this script."
@@ -1388,15 +1463,18 @@ if blkid "$TARGET_ROOT" | grep -q 'TYPE="crypto_LUKS"'; then
                     fi
                     exec "$SCRIPT_DIR/luks-tune.sh"
                     ;;
-                2)
+                2|config)
                     DEPLOY_MODE="config-only"
                     break
                     ;;
-                3)
+                3|quit)
                     log "Nothing changed. Bye."
                     exit 0
                     ;;
-                *) echo "  Invalid selection '$LUKS2_CHOICE' — enter 1, 2 or 3." ;;
+                *)
+                    [ -z "${LUKS_EXISTING:-}" ] \
+                        || fatal "LUKS_EXISTING must be tune, config or quit (got '$LUKS_EXISTING'). Nothing changed."
+                    echo "  Invalid selection '$LUKS2_CHOICE' — enter 1, 2 or 3." ;;
             esac
         done
     fi
@@ -1649,7 +1727,7 @@ if [ ! -f "/mnt_temp/${SUBPATH}etc/fstab" ]; then
         log "by hand if you want it auto-unlocked; see docs/FILESYSTEMS.md."
         exit 0
     fi
-    read -p "  Encrypt $TARGET_ROOT as a data partition? (yes/no): " DATA_OK
+    ask DATA_OK LUKS_DATA_PARTITION "  Encrypt $TARGET_ROOT as a data partition? (yes/no): "
     [ "$DATA_OK" = "yes" ] || fatal "Aborted — no system found and data mode declined."
     SYSTEM_MODE=0
 fi
@@ -1752,7 +1830,7 @@ resolve_boot_partition() {
             err "    Target fstab wants  : $spec → ${fstab_dev}"
             err "  The pinned $role partition likely belongs to a DIFFERENT install."
             err "  Writing boot config there would break BOTH systems."
-            read -p "  Use $dev anyway? (Type 'MISMATCH' to override): " XCHK
+            ask XCHK LUKS_MISMATCH_OVERRIDE "  Use $dev anyway? (Type 'MISMATCH' to override): "
             [ "$XCHK" = "MISMATCH" ] || fatal "Fix the partition selection and re-run."
         fi
     elif [ -n "$fstab_dev" ]; then
@@ -1870,7 +1948,8 @@ for i in "${!MNT_MPS[@]}"; do
     d=$(lsblk -dno PKNAME "${MNT_DEVS[$i]}" 2>/dev/null | head -n1)
     if [ -n "$d" ] && [ "$d" != "$DISK_ROOT" ]; then
         warn "${MNT_MPS[$i]} (${MNT_DEVS[$i]}) is on disk '$d' but ROOT is on '$DISK_ROOT'!"
-        read -p "Proceed with partitions on different disks? (yes/no): " cross_disk
+        cross_disk=""
+        ask cross_disk LUKS_CROSS_DISK "Proceed with partitions on different disks? (yes/no): "
         [ "$cross_disk" = "yes" ] || fatal "Aborted."
         break
     fi
@@ -2035,7 +2114,8 @@ if [ "$IS_BTRFS" -eq 1 ] && [ -n "$BLS_ROOT_SUBVOL" ] && [ "$BLS_ROOT_SUBVOL" !=
     warn "  The script will mount and modify the fstab subvolume."
     warn "  If the system boots from a DIFFERENT subvolume, config changes"
     warn "  may not take effect. Consider fixing this inconsistency first."
-    read -p "  Continue anyway? (yes/no): " subvol_override
+    subvol_override=""
+    ask subvol_override LUKS_SUBVOL_MISMATCH "  Continue anyway? (yes/no): "
     [ "$subvol_override" = "yes" ] || fatal "Fix subvolume inconsistency first."
 fi
 
@@ -2061,15 +2141,17 @@ if [ "$DRY_RUN" = "1" ]; then
     DO_CHECK="n"
     log "[dry-run] Skipping the $ORIG_FSTYPE integrity check (a real run offers it here)."
 else
-    read -p "Run a read-only $ORIG_FSTYPE integrity check first? (Recommended, takes 5-30 min) [Y/n]: " DO_CHECK
+    ask DO_CHECK LUKS_FSCK "Run a read-only $ORIG_FSTYPE integrity check first? (Recommended, takes 5-30 min) [Y/n]: "
 fi
-if [ "$DO_CHECK" != "n" ] && [ "$DO_CHECK" != "N" ]; then
+case "$DO_CHECK" in [Nn]|[Nn][Oo]) DO_CHECK=n ;; esac
+if [ "$DO_CHECK" != "n" ]; then
     log "  Running read-only $ORIG_FSTYPE check (this may take a while)..."
     if fs_check_ro "$CHECK_DEV" "$ORIG_FSTYPE"; then
         log "  Filesystem check: PASSED"
     else
         err "  Filesystem check found errors!"
-        read -p "  Continue despite filesystem errors? (Type 'FORCE' to override): " fsck_override
+        fsck_override=""
+        ask fsck_override LUKS_FSCK_FORCE "  Continue despite filesystem errors? (Type 'FORCE' to override): "
         [ "$fsck_override" = "FORCE" ] || fatal "Fix filesystem errors before encrypting."
     fi
 else
@@ -2275,10 +2357,10 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 if [ "$DEPLOY_MODE" = "config-only" ]; then
-    read -p "Type 'CONFIGURE' to redo the configuration phase: " CONFIRM
+    ask CONFIRM LUKS_CONFIRM "Type 'CONFIGURE' to redo the configuration phase: "
     [ "$CONFIRM" = "CONFIGURE" ] || fatal "Aborted."
 else
-    read -p "Type 'ENCRYPT' to begin — there is no going back: " CONFIRM
+    ask CONFIRM LUKS_CONFIRM "Type 'ENCRYPT' to begin — there is no going back: "
     [ "$CONFIRM" = "ENCRYPT" ] || fatal "Aborted."
 fi
 
@@ -2311,7 +2393,7 @@ else
         warn "  Cannot probe the $ORIG_FSTYPE size to verify whether a previous run"
         warn "  already shrank it. If this is a RE-RUN after an interruption and the"
         warn "  shrink step had completed, answer yes."
-        read -p "  Was this filesystem already shrunk by a previous run? (yes/NO): " PREV_SHRUNK
+        ask PREV_SHRUNK LUKS_ALREADY_SHRUNK "  Was this filesystem already shrunk by a previous run? (yes/NO): "
         [ "$PREV_SHRUNK" = "yes" ] && SKIP_SHRINK=1
     fi
 
@@ -2448,7 +2530,10 @@ if [ "$INNER_UUID" != "$ORIG_FS_UUID" ]; then
     err "  filesystem. It usually means the open mapper is backed by a DIFFERENT"
     err "  device than expected, or the filesystem was damaged. Continuing"
     err "  would write boot configuration for the wrong system."
-    read -p "  Continue with UUID $INNER_UUID anyway? (Type 'UUID-CHANGED' to override): " UUID_OVERRIDE
+    # Deliberately no environment pin: this state means the wrong device is
+    # open, and no unattended run should answer it. Without a terminal the
+    # read fails and the run stops here.
+    read -r -p "  Continue with UUID $INNER_UUID anyway? (Type 'UUID-CHANGED' to override): " UUID_OVERRIDE
     [ "$UUID_OVERRIDE" = "UUID-CHANGED" ] || fatal "Aborted — investigate before configuring anything."
     warn "  Override accepted — updating ORIG_FS_UUID to $INNER_UUID."
     ORIG_FS_UUID="$INNER_UUID"
@@ -2690,9 +2775,9 @@ if [ -z "$RK_CHOICE" ]; then
     if [ "$RK_DEFAULT" = "no" ]; then
         warn "  This is a configuration-only re-run: saying yes adds ANOTHER"
         warn "  keyslot on top of what is already there. Defaulting to no."
-        read -p "  Generate and enroll a recovery key now? [y/N]: " RK_CHOICE
+        ask RK_CHOICE LUKS_RECOVERY_KEY "  Generate and enroll a recovery key now? [y/N]: "
     else
-        read -p "  Generate and enroll a recovery key now? [Y/n]: " RK_CHOICE
+        ask RK_CHOICE LUKS_RECOVERY_KEY "  Generate and enroll a recovery key now? [Y/n]: "
     fi
     # A bare Enter takes the default rather than falling through to "enrol".
     RK_CHOICE="${RK_CHOICE:-$RK_DEFAULT}"
@@ -2863,7 +2948,10 @@ if grep -q "UUID=$ORIG_FS_UUID" /mnt/etc/fstab; then
 elif [ -n "$ORIG_PARTUUID" ] && grep -q "PARTUUID=$ORIG_PARTUUID" /mnt/etc/fstab; then
     sed -i "s|PARTUUID=$ORIG_PARTUUID|/dev/mapper/$LUKS_NAME|g" /mnt/etc/fstab
     log "  fstab: PARTUUID=$ORIG_PARTUUID → /dev/mapper/$LUKS_NAME"
-elif grep -Eq "^[^#]*[[:space:]]/[[:space:]].*$(basename "$TARGET_ROOT")" /mnt/etc/fstab; then
+elif grep -Eq "^[^#]*$(basename "$TARGET_ROOT")[[:space:]]+/[[:space:]]" /mnt/etc/fstab; then
+    # The device comes BEFORE the mountpoint on an fstab line, so the name is
+    # matched ahead of the lone '/', the way the sed below already expected.
+    # (An earlier version looked for it after the mountpoint and never matched.)
     sed -i "s|^[^#]*$(basename "$TARGET_ROOT")\([[:space:]]\+/[[:space:]]\)|/dev/mapper/$LUKS_NAME\1|" /mnt/etc/fstab
     log "  fstab: $TARGET_ROOT → /dev/mapper/$LUKS_NAME (device-path entry)"
 elif grep -q "/dev/mapper/$LUKS_NAME" /mnt/etc/fstab; then
@@ -3261,8 +3349,13 @@ fi
 cp "$SCRIPT_DIR/lib-boot.sh" /mnt/tmp/.luks-lib-boot.sh 2>/dev/null \
     || warn "  Could not copy lib-boot.sh into the chroot — the splash will not be stripped."
 
-CHROOT_RC=0
-chroot /mnt /bin/bash <<'CHROOT_SCRIPT' || CHROOT_RC=$?
+# The chroot phase is written to a file and run with stdin closed, never fed
+# to bash on its stdin. A here-document of this size travels through a pipe,
+# bash reads a pipe unbuffered so that its children can share it, and any
+# child that reads stdin — a hook that asks a question, a debconf prompt —
+# would swallow the rest of the script and end the phase early with a clean
+# exit code, skipping the UKI rebuild, the signing and the relabel.
+cat > /mnt/tmp/.luks-chroot.sh <<'CHROOT_SCRIPT'
 # ── Inside chroot ──────────────────────────────────────────────────────────
 source /tmp/.luks-deploy-env
 rm -f /tmp/.luks-deploy-env
@@ -3810,7 +3903,9 @@ echo "[CHROOT] ═════════════════════�
 exit $ERRORS
 CHROOT_SCRIPT
 
-rm -f /mnt/tmp/.luks-deploy-env 2>/dev/null || true
+CHROOT_RC=0
+chroot /mnt /bin/bash /tmp/.luks-chroot.sh </dev/null || CHROOT_RC=$?
+rm -f /mnt/tmp/.luks-chroot.sh /mnt/tmp/.luks-deploy-env 2>/dev/null || true
 
 if [ "$CHROOT_RC" -ne 0 ]; then
     err "Chroot reported $CHROOT_RC error(s)!"
@@ -4246,7 +4341,14 @@ fi
 echo "Summary of changes:"
 echo "  crypttab    : $LUKS_NAME UUID=$LUKS_UUID none $CRYPTTAB_OPTS"
 echo "  fstab       : /dev/mapper/$LUKS_NAME (was UUID=$ORIG_FS_UUID)"
-[ -f /mnt/etc/default/grub ]     && echo "  grub default: GRUB_ENABLE_CRYPTODISK=y${LUKS_BOOT_ARGS:+ + LUKS kernel args}"
+if [ -f /mnt/etc/default/grub ]; then
+    # GRUB_ENABLE_CRYPTODISK is never written (stage 6c): /boot stays clear.
+    if [ -n "$LUKS_BOOT_ARGS" ]; then
+        echo "  grub default: GRUB_CMDLINE_LINUX carries the LUKS kernel args (GRUB_ENABLE_CRYPTODISK untouched)"
+    else
+        echo "  grub default: root=/resume= point at the mapper; unlock is crypttab-driven (GRUB_ENABLE_CRYPTODISK untouched)"
+    fi
+fi
 [ -f /mnt/etc/kernel/cmdline ]   && echo "  kernel cmd  : ${LUKS_BOOT_ARGS:-'(crypttab-driven)'}"
 [ -d /mnt/boot/loader/entries ]  && [ -n "$LUKS_BOOT_ARGS" ] && echo "  BLS entries : ALL updated with LUKS parameters"
 [ -n "$RPI_CMDLINE" ]            && echo "  cmdline.txt : root=/dev/mapper/$LUKS_NAME"
