@@ -512,6 +512,31 @@ a guess does not need anyone standing in front of it. The difference is
 not a matter of taste or of threat model. One of these is the state of the
 art, and the other is the state of 2000 with a security guard.
 
+**The scorecard**, since both companies like to publish one:
+
+| | Apple, FileVault | Microsoft, BitLocker | A Linux laptop |
+|---|---|---|---|
+| Function between your password and your disk | PBKDF2-SHA256, standardized 2000 | a chained SHA-256 designed for Vista in 2006 — or, by default, nothing | argon2id, RFC 9106 |
+| Parameters published | once, in 2012, by three outsiders who reverse-engineered it | in a white paper from the Vista era | in the header of every volume: `cryptsetup luksDump` prints them |
+| Memory per guess | a few hundred bytes | a few hundred bytes | 1, 2 or 4 GiB |
+| A typical password, one RTX 4090 × 1,000 | 42 minutes | 15 hours | decades |
+| The same, one 3.6 kW Bitcoin miner | minutes, on silicon built for its primitive | 35 minutes | cannot run: the chip has no memory |
+| Six diceware words, every Bitcoin ASIC on Earth | 72 days | 2.5 years | past the age of the universe |
+| What stops the attacker in practice | a Secure Enclave, on the Macs that have one | a TPM, whose key has been read off the wires on camera | the function |
+| Major OS releases shipped since argon2 won, each launched as the most secure yet | eleven | two | — |
+| Cost of the fix | a library call; libsodium has shipped argon2id since 2016 | the same | done in 2017 |
+| Market value | trillions | trillions | free |
+
+Two of the largest engineering organizations in history, with the
+literature on their desks and the function in the libraries they already
+link, have each shipped a decade of "most secure ever" releases around a
+hash that a hobbyist's mining rig chews through before the kettle boils —
+and each has answered every public demonstration by reinforcing the box the
+hash hides in, never the hash. It is not that they cannot do better. A
+volunteer with a laptop did better in 2017, and it has been the default on
+that laptop ever since. It is that nobody at either company has been made
+to.
+
 **Cosmic time.** `luks-tune.sh` states the cost of every keyslot it writes
 as the years a thousand 24 GiB GPUs would need to search half the passphrase
 space, anchored to what the universe is doing by then. Run the same model
