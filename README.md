@@ -479,6 +479,45 @@ sets how many guesses. Microsoft and Apple chose to keep the price low and
 guard the till with a chip. LinuxLocker charges 4 GiB at the door, on any
 silicon, and the chip is not invited.
 
+**And against an ASIC farm.** A graphics card is a general-purpose machine
+being polite. The real adversary of a memory-free hash is the ASIC: a chip
+that does one hash and nothing else, and the hash it does, by the
+exahash, is SHA-256 — the exact primitive inside BitLocker's chain and
+FileVault's PBKDF2. This is not hypothetical hardware. It is the most
+mass-produced special-purpose silicon on the planet, and there is roughly a
+zettahash per second of it running right now: the Bitcoin network sat at
+about 1,000 EH/s of SHA-256d through 2026, which is two thousand billion
+billion SHA-256 compressions every second, all day, for a reward that
+happens to be a coin. One
+[Antminer S21 XP](https://support.bitmain.com/hc/en-us/articles/35383015643673-S21-XP-Specifications)
+does 270 TH/s from a 3,645 W wall socket; on BitLocker's 2^20-round chain
+that is about 260 million guesses a second, or twenty-five thousand RTX 4090s
+in a box the size of a shoebox. Point the network at the loops and the
+table above collapses:
+
+| Passphrase | BitLocker chain, all of Bitcoin's ASICs | FileVault PBKDF2, the same | argon2id 4 GiB, a thousand memory-bound ASICs* |
+|---|---|---|---|
+| a typical human password (~40 bits) | **0.6 milliseconds** | **45 microseconds** | two months |
+| 6 diceware words (77 bits) | **2.5 years** | **72 days** | 10^10 years — long past the age of the universe |
+| 8 diceware words (103 bits) | 10^8 years — less than the age of the universe | 10^7 years — less than the age of the universe | 10^18 years — **galaxies have evaporated** |
+
+\* There is no argon2id ASIC to buy, and the reason is the point. argon2id
+at 4 GiB and ten passes moves about 80 GiB through memory per guess, so a
+chip built for nothing else is bounded by DRAM bandwidth and DRAM capacity,
+and those cost the attacker exactly what they cost you. The column assumes a
+thousand parts each with 8 TB/s of HBM — twice the best accelerator on sale
+— and 400 GiB resident to keep a hundred guesses in flight, so a hundred
+guesses a second each. That is a generous upper bound on a machine nobody
+has built, and six words are still past the age of the universe behind it.
+
+Six diceware words against Microsoft's function, on hardware that exists and
+is switched on today, is a project of two and a half years. Against Apple's,
+ten weeks. Nobody will redirect Bitcoin at your laptop; but the number says
+what the function is worth on its own, which is why neither company lets it
+stand on its own. argon2id's answer to the ASIC is not a bigger N. It is a
+bill for 4 GiB of RAM per guess that no foundry can discount — the only
+currency a hash can charge that special silicon does not devalue.
+
 ## Environment knobs (fleet / non-interactive use)
 
 ```
