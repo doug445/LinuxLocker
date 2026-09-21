@@ -399,6 +399,86 @@ make every guess genuinely expensive on any silicon, and let the passphrase do
 the rest — which is why the passphrase advice here is not decoration. Under
 Linux it is the TPM you chose not to trust.
 
+### pbkdf2 is a `for` loop — and two of the richest companies on Earth still ship it
+
+Strip the acronym off and this is what PBKDF2 is:
+
+```
+u = HMAC(password, salt)
+for i in 2..N:
+    u = HMAC(password, u)      # keep a running XOR; that is the key
+```
+
+That is the whole function. One hash, fed back into itself N times, with a
+few hundred bytes of state. It was standardized in September 2000 (PKCS #5
+v2.0, RFC 2898), when the fastest graphics card you could buy had four pixel
+pipelines and no programmable shaders. Its only knob is N, and N buys you
+linear time on a machine that has nothing but time: a modern GPU holds
+sixteen thousand cores, each of which runs this loop on its own password
+with no need to talk to any other. Raising N by ten makes the attacker wait
+ten times longer, and makes you wait ten times longer, and the attacker has
+ten thousand times more cores than you do. That is the entire negotiating
+position of a memory-free KDF, and it was lost before it started.
+
+Password hashing moved on. The Password Hashing Competition ran from 2013
+to 2015 precisely because the field had understood that the only cost a GPU
+cannot parallelize away is **memory**: argon2 won, argon2id became RFC 9106,
+and LUKS2 made it the default in cryptsetup 2.0. Every Linux distribution's
+installer has been writing argon2 keyslots since 2018. It is not exotic. It
+is not new. It is what a disk encryptor does now.
+
+**Apple's FileVault** stretches your login password with PBKDF2-SHA256. The
+iteration count was last seen in public in 2012, when three researchers had
+to reverse-engineer it to find out (41,000 rounds, in *Infiltrate the Vault*);
+Apple has not published a number since and does not document the function
+at all. On an Intel Mac without a T2, that loop is the entire wall between
+your data and a graphics card. On newer Macs the Secure Enclave takes over,
+which is Apple's tacit admission of the same point: the function cannot be
+allowed anywhere an attacker can run it, so it is hidden inside a chip and
+you are asked to trust the chip.
+
+**Microsoft's BitLocker** does not even reach PBKDF2. Its password and
+recovery-key paths stretch with a home-grown chained SHA-256, 2^20 rounds,
+another memory-free loop — and its *default* mode stretches nothing at all:
+TPM-only BitLocker releases the volume key when the firmware measurements
+match, and no passphrase is ever typed. The key then crosses a bus. Discrete
+TPMs have had it sniffed off the SPI lines with a logic analyser in under a
+minute, on camera, more than once. Microsoft's answer to "what if the
+attacker has a GPU" was to move the problem into a chip and hope the wires
+hold. They did not.
+
+Both companies own more silicon than most governments. Both employ people
+who know exactly what argon2 is. Both ship a `for` loop from the year 2000
+and put a hardware chaperone in front of it, so that the loop is never
+caught outside alone. Linux ships argon2id and lets it stand in the open,
+because it can.
+
+**Cosmic time.** `luks-tune.sh` states the cost of every keyslot it writes
+as the years a thousand 24 GiB GPUs would need to search half the passphrase
+space, anchored to what the universe is doing by then. Run the same model
+over the three functions — the GPU rates for the two loops are a
+[published RTX 4090 hashcat run](https://gist.github.com/Chick3nman/32e662a5bb63bc4f51b847bb422222fd)
+(BitLocker: 10,025 guesses/s per card; PBKDF2-SHA256: 8.87 billion
+iterations/s per card, so ~216,000 guesses/s at 41,000 rounds); argon2id is
+LinuxLocker's `aggressive` profile at the reference machine's 16 s per guess,
+six guesses per card because 24 GiB holds six 4 GiB working sets:
+
+| Passphrase | BitLocker SHA-256 chain | FileVault PBKDF2 | LinuxLocker argon2id (4 GiB) |
+|---|---|---|---|
+| a typical human password (~40 bits) | **15 hours** | **42 minutes** | decades |
+| 6 diceware words (77 bits) | 10^8 years — less than the age of the universe | 10^7 years — less than the age of the universe | 10^13 years — **long past the age of the universe** |
+| 8 diceware words (103 bits) | 10^16 years — every star has burned out | 10^15 years — every star has burned out | 10^21 years — **galaxies have evaporated** |
+
+Read the top row. That is the password most people actually have, and
+against the two loops it is a lunch break. The passphrase rows are where the
+loops look respectable — until you notice that on those rows argon2id is a
+million times further out, and that the universe is 1.4 × 10^10 years old:
+six good words behind a `for` loop still fall inside its lifetime; behind
+argon2id they do not. The KDF sets the price of one guess; the passphrase
+sets how many guesses. Microsoft and Apple chose to keep the price low and
+guard the till with a chip. LinuxLocker charges 4 GiB at the door, on any
+silicon, and the chip is not invited.
+
 ## Environment knobs (fleet / non-interactive use)
 
 ```
