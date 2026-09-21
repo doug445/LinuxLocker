@@ -420,6 +420,19 @@ ten times longer, and makes you wait ten times longer, and the attacker has
 ten thousand times more cores than you do. That is the entire negotiating
 position of a memory-free KDF, and it was lost before it started.
 
+**Be precise about the charge: pbkdf2 is not broken. It is obsolete, which
+is worse.** A broken function gets a CVE, a headline, a patch and a
+deadline; it is gone from production within a year because something forced
+it out. An obsolete function does exactly what it promised in 2000, passes
+every test written for it, throws no error and files no bug — and so it
+stays. Nothing forces it out. It is simply outrun: the hardware it was
+designed against no longer exists, the hardware that exists was built to eat
+it, and the function keeps reporting success while the wall it was supposed
+to be sinks below the attacker's knees. Broken gets fixed. Obsolete gets
+shipped, for another twenty-five years, by people who can point to the
+standard. That is why LinuxLocker treats a keyslot still on pbkdf2 as a
+defect to be converted, not a working configuration to be respected.
+
 Password hashing moved on. The Password Hashing Competition ran from 2013
 to 2015 precisely because the field had understood that the only cost a GPU
 cannot parallelize away is **memory**: argon2 won, argon2id became RFC 9106,
