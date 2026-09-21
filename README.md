@@ -424,7 +424,31 @@ LUKS_GRUB_KDF_FACTOR=<x>                   unlock-time multiplier for a volume G
                                            itself unlocks (default 8.5, measured)
 LUKS_GRUB_ARGON2_MAX_KIB=<n>               argon2id ceiling for such a volume
                                            (default 1 GiB — the x86 UEFI heap)
+
+LUKS_CONFIRM=ENCRYPT|CONFIGURE|CONVERT     the typed point-of-no-return gate of the
+                                           mode the run reaches; a mismatch is fatal
+LUKS_STALE_MAPPER=keep|close               a mapper left open by an earlier run
+LUKS_LIVE_OVERRIDE=LIVE                    run from a root that is not a live environment
+LUKS_BATTERY_OVERRIDE=BATTERY              run on battery below 50%
+LUKS_UNMOUNT=yes|no                        unmount a target a live desktop mounted
+LUKS_RESUME=yes|no                         finish an interrupted encryption
+LUKS_EXISTING=tune|config|quit             what to do with a finished LUKS2 volume
+LUKS_PROFILE=...|skip                      also answers the re-costing menu after a
+                                           LUKS1 conversion ('skip' keeps pbkdf2)
+LUKS_DATA_PARTITION=yes|no                 encrypt a volume with no fstab as data
+LUKS_MISMATCH_OVERRIDE=MISMATCH            keep a pinned /boot or EFI the target's
+                                           fstab disagrees with
+LUKS_CROSS_DISK=yes|no                     proceed with /boot or EFI on another disk
+LUKS_SUBVOL_MISMATCH=yes|no                proceed when BLS and fstab disagree on subvol
+LUKS_FSCK=yes|no                           run the read-only integrity check first
+LUKS_FSCK_FORCE=FORCE                      continue past filesystem errors
+LUKS_ALREADY_SHRUNK=yes|no                 f2fs/vfat: shrunk by an interrupted run?
 ```
+
+Without a terminal, a prompt that has no pin stops the run and names the
+variable it wanted; nothing hangs, and nothing is answered by default. The one
+prompt with no pin at all is the inner-UUID-changed override: that state means
+the wrong device is open, and no fleet should answer it blind.
 
 The UKI and Secure Boot knobs are documented in full, with detection order and
 key-discovery paths, in [BOOTLOADERS.md](docs/BOOTLOADERS.md).
@@ -682,8 +706,12 @@ costs you nothing.
 
 ### Can I run it unattended across several machines?
 
-Yes. Every prompt has an `LUKS_*` environment variable behind it — see
-[Environment knobs](#environment-knobs-fleet--non-interactive-use). Pin
+Yes. Every prompt has an `LUKS_*` environment variable behind it, except the
+inner-UUID-changed override, which means the wrong device is open and is
+never answered blind — see
+[Environment knobs](#environment-knobs-fleet--non-interactive-use). Run
+without a terminal, a prompt that has no pin stops the run and names its
+variable rather than hanging or dying on a failed read. Pin
 `LUKS_PBKDF_MEMORY` / `_ITER` / `_PARALLEL` for reproducible KDF cost across a
 fleet rather than per-machine benchmark drift; pinned values below the floor are
 fatal rather than silently raised, precisely so the numbers you pinned are the
@@ -816,6 +844,19 @@ v1.4.3 — five real bugs, the command-line carrier layer, encrypted-`/boot`
 recognition, the harden-only guarantee — and v1.5.0 marks the audited state.
 Nothing in this tool has changed hands: the design decisions are the
 author's, the audit checked that the code keeps them.
+
+Audited again on 2026-09-21 by **Claude Fable 5.1**, against v1.6.0: every
+script read in full, the three test suites run, and each finding reproduced
+before it was reported. Five bugs came out of it and were fixed in the same
+pass — the diagnostic script shipped without its execute bit, the fstab
+device-path branch could never match a real line, the chroot phase was fed
+to bash on stdin where any child that reads it would have swallowed the rest,
+the summary claimed a `GRUB_ENABLE_CRYPTODISK=y` the tool never writes, and
+the unattended-use claim was not true until every prompt was given a pin.
+The design gaps it named that are still open — an end-to-end boot of the
+Fedora, Ubuntu and Arch GRUB paths, a console-keymap check for the initramfs,
+`sgdisk` in the dependency map — are recognized here so that nobody mistakes
+the passing suites for a boot.
 
 ## License and contact
 
