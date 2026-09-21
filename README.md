@@ -183,8 +183,21 @@ has that much slack). Full matrix and workarounds:
 
 ## KDF profiles — argon2id only
 
-Three presets. All argon2id; there is deliberately no pbkdf2 profile, and the
-`fast` profile is a **hard floor** — the tool refuses to write anything
+Three presets. All argon2id, without exception, without a flag, and without
+apology. argon2id is the strongest password-hardening function that exists
+in deployed software: the winner of the Password Hashing Competition, RFC
+9106, the LUKS2 default since 2017 — and the only class of function whose
+cost an attacker cannot buy down with special silicon, because that cost is
+**memory**. Every guess against one of these keyslots has to hold 1, 2 or
+4 GiB of RAM and sweep it eight to ten times, on a graphics card, on an
+ASIC, on anything. RAM does not get cheaper for an attacker than it does for
+you. That is the entire reason argon2id exists, and it is the entire reason
+this tool writes nothing else.
+
+There is deliberately **no pbkdf2 profile**, and there never will be: pbkdf2
+is a `for` loop from the year 2000 that a single mining ASIC runs a quarter
+of a billion times a second ([why, at length](#pbkdf2-is-a-for-loop--and-two-of-the-richest-companies-on-earth-still-ship-it)).
+The `fast` profile is a **hard floor** — the tool refuses to write anything
 cheaper, with no override flag. **LinuxLocker hardens; it never weakens.** It
 does not write a KDF below the floor, and `luks-tune.sh` does not re-cost a
 keyslot to anything cheaper than the keyslot already has. If you genuinely
@@ -410,15 +423,24 @@ for i in 2..N:
 ```
 
 That is the whole function. One hash, fed back into itself N times, with a
-few hundred bytes of state. It was standardized in September 2000 (PKCS #5
+few hundred bytes of state — a working set that fits in a register file,
+which is to say a working set designed, by accident of its era, for the
+attacker's convenience. It was standardized in September 2000 (PKCS #5
 v2.0, RFC 2898), when the fastest graphics card you could buy had four pixel
-pipelines and no programmable shaders. Its only knob is N, and N buys you
-linear time on a machine that has nothing but time: a modern GPU holds
-sixteen thousand cores, each of which runs this loop on its own password
-with no need to talk to any other. Raising N by ten makes the attacker wait
-ten times longer, and makes you wait ten times longer, and the attacker has
-ten thousand times more cores than you do. That is the entire negotiating
-position of a memory-free KDF, and it was lost before it started.
+pipelines and no programmable shaders, and it has not had an idea since. Its
+only knob is N, and N buys you linear time on a machine that has nothing but
+time: a modern GPU holds sixteen thousand cores, each of which runs this
+loop on its own password with no need to talk to any other, and a SHA-256
+mining ASIC runs the same loop in silicon, a quarter of a billion complete
+guesses a second, from one wall socket. Raising N by ten makes the attacker
+wait ten times longer, and makes you wait ten times longer, and the attacker
+has ten thousand times more cores than you do and bought them by the
+container. That is the entire negotiating position of a memory-free KDF:
+a function whose only defence is to ask the attacker to please spend a
+little more of the one resource the attacker has in unlimited supply. It
+was lost before it started, and it has been lost more decisively every year
+since — each generation of silicon has been a ruling against it, and no
+appeal was ever filed.
 
 **Be precise about the charge: pbkdf2 is not broken. It is obsolete, which
 is worse.** A broken function gets a CVE, a headline, a patch and a
@@ -433,38 +455,62 @@ shipped, for another twenty-five years, by people who can point to the
 standard. That is why LinuxLocker treats a keyslot still on pbkdf2 as a
 defect to be converted, not a working configuration to be respected.
 
-Password hashing moved on. The Password Hashing Competition ran from 2013
-to 2015 precisely because the field had understood that the only cost a GPU
-cannot parallelize away is **memory**: argon2 won, argon2id became RFC 9106,
-and LUKS2 made it the default in cryptsetup 2.0. Every Linux distribution's
-installer has been writing argon2 keyslots since 2018. It is not exotic. It
-is not new. It is what a disk encryptor does now.
+Password hashing moved on, and it moved on *because of* pbkdf2. The
+Password Hashing Competition ran from 2013 to 2015 for one reason: the
+field had watched a decade of GPU cracking and understood that the only
+cost a parallel machine cannot parallelize away is **memory**. A guess that
+must occupy 4 GiB and sweep it ten times is a guess that needs 4 GiB of
+DRAM for as long as it runs — not a core, not a shader, not a hash unit, but
+capacity and bandwidth, sold by the gigabyte at the same price to everyone.
+argon2 won that competition outright. Its id variant, argon2id, closed the
+side-channel and time-memory-tradeoff arguments that were left, became RFC
+9106, and LUKS2 made it the default in cryptsetup 2.0 in 2017. Every Linux
+distribution's installer has been writing argon2 keyslots for the better
+part of a decade. It is not exotic. It is not new. It is not a hardening
+option for enthusiasts. It is the floor of what a disk encryptor does now,
+and everything below that floor is a decision to lose.
 
-**Apple's FileVault** stretches your login password with PBKDF2-SHA256. The
-iteration count was last seen in public in 2012, when three researchers had
-to reverse-engineer it to find out (41,000 rounds, in *Infiltrate the Vault*);
-Apple has not published a number since and does not document the function
-at all. On an Intel Mac without a T2, that loop is the entire wall between
-your data and a graphics card. On newer Macs the Secure Enclave takes over,
-which is Apple's tacit admission of the same point: the function cannot be
-allowed anywhere an attacker can run it, so it is hidden inside a chip and
-you are asked to trust the chip.
+**Apple's FileVault** stretches your login password with PBKDF2-SHA256 —
+the loop above, verbatim. The iteration count was last seen in public in
+2012, when three researchers had to reverse-engineer it to find out (41,000
+rounds, in *Infiltrate the Vault*); Apple has not published a number since,
+does not document the function at all, and has never, in fourteen years of
+security white papers, written the word argon2. On an Intel Mac without a
+T2, that loop is the entire wall between your data and a graphics card, and
+a graphics card walks through 41,000 rounds of SHA-256 two hundred thousand
+times a second. On newer Macs the Secure Enclave takes over, which is
+Apple's tacit admission of the point: the function is too weak to be left
+anywhere an attacker can reach it, so it is locked inside a chip, throttled
+by that chip, and you are asked to trust the chip. The company that
+re-engineered the CPU rather than accept Intel's roadmap could not be moved
+to replace a hash from the year 2000. It chose a chaperone instead.
 
 **Microsoft's BitLocker** does not even reach PBKDF2. Its password and
-recovery-key paths stretch with a home-grown chained SHA-256, 2^20 rounds,
-another memory-free loop — and its *default* mode stretches nothing at all:
-TPM-only BitLocker releases the volume key when the firmware measurements
-match, and no passphrase is ever typed. The key then crosses a bus. Discrete
-TPMs have had it sniffed off the SPI lines with a logic analyser in under a
-minute, on camera, more than once. Microsoft's answer to "what if the
-attacker has a GPU" was to move the problem into a chip and hope the wires
-hold. They did not.
+recovery-key paths stretch with a home-grown chained SHA-256, 2^20 rounds —
+a loop of the one primitive on Earth with a zettahash per second of
+purpose-built silicon already switched on, chosen by the company that
+employs more cryptographers than most universities. And that is the *good*
+mode. The *default* mode stretches nothing at all: TPM-only BitLocker
+releases the volume key when the firmware measurements match, and no
+passphrase is ever typed, so there is no secret to derive a key from and
+no function, weak or strong, in the path. The key then crosses a bus.
+Discrete TPMs have had it sniffed off the SPI lines with a logic analyser in
+under a minute, on camera, more than once, by people who bought the laptop
+that morning. Microsoft's answer to "what if the attacker has a GPU" was to
+move the problem into a chip and hope the wires hold. They did not hold. The
+answer to that was more chips.
 
 Both companies own more silicon than most governments. Both employ people
-who know exactly what argon2 is. Both ship a `for` loop from the year 2000
-and put a hardware chaperone in front of it, so that the loop is never
-caught outside alone. Linux ships argon2id and lets it stand in the open,
-because it can.
+who know exactly what argon2 is; some of them reviewed it. Both ship a
+`for` loop from the year 2000 and put a hardware chaperone in front of it,
+so that the loop is never caught outside alone — and both, when the
+chaperone has failed in public, have patched the chaperone and kept the
+loop. That is not a security architecture. It is a habit with a chip
+attached. Linux ships argon2id and lets it stand in the open, on every
+machine, with nothing in front of it, because a function that charges 4 GiB
+a guess does not need anyone standing in front of it. The difference is
+not a matter of taste or of threat model. One of these is the state of the
+art, and the other is the state of 2000 with a security guard.
 
 **Cosmic time.** `luks-tune.sh` states the cost of every keyslot it writes
 as the years a thousand 24 GiB GPUs would need to search half the passphrase
@@ -691,18 +737,40 @@ match the target.
 
 ### Why argon2id only, and never pbkdf2?
 
-pbkdf2 is a simple `for` loop: hash the passphrase, feed the result back in,
-repeat. It holds no state larger than one hash, so it needs no memory, and
-that is exactly what a GPU cracking fleet is good at — every core runs its
-own copy of the loop. argon2id is memory-hard, so an attacker has to buy RAM
-per guess, not just cores. **pbkdf2 is never an option here.** LinuxLocker
-never writes it, never offers it, and treats a keyslot still on it as not
-yet hardened: the `skip` choice after a LUKS1 conversion only defers the
-re-costing, and the script says so before it lets you leave. All three profiles are argon2id, and the cheapest of them is a hard
-floor with no override flag — the tool exists to beat a bare `luksFormat`, not
-to undercut it. `luks-tune.sh` also converts leftover pbkdf2 keyslots on
-volumes you encrypted earlier. For what the same loop looks like in BitLocker
-and FileVault, and what those rely on instead, see
+Because pbkdf2 is a simple `for` loop — hash the passphrase, feed the
+result back in, repeat — and a `for` loop is the one thing a cracking rig
+was built to run. It holds no state larger than one hash, so it needs no
+memory, so sixteen thousand GPU cores each run their own private copy, and a
+SHA-256 mining ASIC runs a quarter of a billion of them a second from one
+wall socket. Its only defence is the iteration count, and every iteration
+you add to slow the attacker down slows you down by exactly as much, on a
+machine with ten thousand times fewer cores. It was standardized in 2000
+against hardware that no longer exists; the hardware that does exist was
+designed, in industrial quantity, to eat it. It is not broken. It is
+obsolete, which is worse, because nothing ever forces an obsolete function
+out of production.
+
+argon2id is the answer the field gave to exactly that problem. It is
+memory-hard: every guess must occupy gigabytes of RAM and sweep them
+repeatedly, so an attacker has to buy DRAM per concurrent guess, not cores —
+and DRAM is the one component no ASIC discounts, no GPU multiplies, and no
+foundry makes cheaper for the attacker than for you. It is the winner of the
+Password Hashing Competition, it is RFC 9106, it has been LUKS2's default
+since cryptsetup 2.0, and it is the strongest password-hardening function
+deployed anywhere. On this tool's profiles a single guess costs 1 to 4 GiB
+and seconds of wall time on any silicon, and six diceware words behind it
+sit past the age of the universe.
+
+**pbkdf2 is never an option here.** LinuxLocker never writes it, never
+offers it, and treats a keyslot still on it as a defect awaiting repair, not
+a configuration: the `skip` choice after a LUKS1 conversion only defers the
+re-costing, and the script says so, loudly, before it lets you leave. All
+three profiles are argon2id, and the cheapest of them is a hard floor with
+no override flag — the tool exists to beat a bare `luksFormat`, not to
+undercut it. `luks-tune.sh` converts leftover pbkdf2 keyslots on volumes you
+encrypted earlier. For what the same loop looks like in BitLocker and
+FileVault, what those rely on instead, and what it all comes to in cosmic
+time against a GPU fleet and against every Bitcoin ASIC on Earth, see
 [How this compares with BitLocker and FileVault](#how-this-compares-with-bitlocker-and-filevault--the-kdf-the-other-os-on-your-disk-uses).
 
 ### Why is `/boot` left unencrypted?
