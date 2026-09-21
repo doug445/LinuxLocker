@@ -313,8 +313,11 @@ harden_path() {                        # harden_path <octal-mode> <path>
 #   LUKS_RESUME=yes|no           finish an interrupted encryption
 #   LUKS_EXISTING=tune|config|quit  what to do with a finished LUKS2 volume
 #   LUKS_PROFILE=...|skip        also answers the re-costing menu after a LUKS1
-#                                conversion; 'skip' leaves the keyslots on pbkdf2
-#                                and is only meaningful there
+#                                conversion; 'skip' defers the re-costing to a
+#                                later run or to luks-tune.sh. pbkdf2 is NEVER
+#                                an option: it is a plain for loop over a hash,
+#                                LinuxLocker never writes it, and a keyslot
+#                                still on it is not hardened
 #   LUKS_DATA_PARTITION=yes|no   encrypt a volume with no /etc/fstab as data
 #   LUKS_MISMATCH_OVERRIDE=MISMATCH
 #                                keep a pinned /boot or EFI partition that the
@@ -1224,7 +1227,8 @@ convert_luks1() {
         case "$GRUB_RECOST" in
             any)       log "[dry-run] then offer per-keyslot argon2id re-costing (all three profiles)." ;;
             fast-only) log "[dry-run] then offer per-keyslot argon2id re-costing (1 GiB only — GRUB unlocks it)." ;;
-            none)      log "[dry-run] and leave the keyslots on pbkdf2 (GRUB unlocks it and has no argon2)." ;;
+            none)      log "[dry-run] and cannot re-cost the keyslots: GRUB unlocks this volume and has no argon2 code."
+                       log "[dry-run] They stay as they are. pbkdf2 is never written and never an option here either — install a GRUB with argon2 and re-run." ;;
         esac
         log "[dry-run] Nothing was changed."
         exit 0
@@ -1294,7 +1298,11 @@ convert_luks1() {
             EST_FAST_GRUB=$(bt_grub_ms "${EST_FAST:-}" || echo "")
             printf "   3) fast          1 GiB,  9 iterations    unlock ~%s in GRUB (~%s kernel-side)\n" \
                 "$(kdf_fmt_ms "${EST_FAST_GRUB:-}")" "$(kdf_fmt_ms "${EST_FAST:-}")"
-            echo   "   4) skip — keep pbkdf2 (re-run later, or use luks-tune.sh)"
+            echo   "   4) skip — defer the re-costing (re-run later, or use luks-tune.sh)"
+            echo ""
+            echo "   pbkdf2 is NOT an option to keep. It is a plain for loop over a hash —"
+            echo "   no memory cost, so every GPU core runs its own copy — and a keyslot"
+            echo "   left on it is not hardened. 'skip' only postpones the fix."
             echo ""
             echo "   aggressive (4 GiB) and moderate (2 GiB) are not offered: GRUB takes"
             echo "   argon2id's memory as ONE contiguous block from the firmware heap,"
@@ -1302,7 +1310,7 @@ convert_luks1() {
             if [ -n "${EST_FAST_GRUB:-}" ] && [ "$EST_FAST_GRUB" -ge $((BT_GRUB_RESET_WALL_S * 1000)) ]; then
                 warn "   ~$(kdf_fmt_ms "$EST_FAST_GRUB") of uninterrupted compute inside GRUB: firmware"
                 warn "   watchdogs have been seen to reset a machine past ~${BT_GRUB_RESET_WALL_S} s. Consider"
-                warn "   keeping pbkdf2, or a custom cost via luks-tune.sh."
+                warn "   deferring the re-costing, or a custom cost via luks-tune.sh."
             fi
             echo ""
             while true; do
@@ -1320,7 +1328,11 @@ convert_luks1() {
             printf "   1) aggressive    4 GiB, 10 iterations    unlock ~%s\n" "$(kdf_fmt_ms "${EST_AGG:-}")"
             printf "   2) moderate      2 GiB,  8 iterations    unlock ~%s   [default]\n" "$(kdf_fmt_ms "${EST_MOD:-}")"
             printf "   3) fast          1 GiB,  9 iterations    unlock ~%s\n" "$(kdf_fmt_ms "${EST_FAST:-}")"
-            echo   "   4) skip — keep pbkdf2 for now (re-run later, or use luks-tune.sh)"
+            echo   "   4) skip — defer the re-costing (re-run later, or use luks-tune.sh)"
+            echo ""
+            echo "   pbkdf2 is NOT an option to keep. It is a plain for loop over a hash —"
+            echo "   no memory cost, so every GPU core runs its own copy — and a keyslot"
+            echo "   left on it is not hardened. 'skip' only postpones the fix."
             if [ "$MEM_TOTAL_KIB" -gt 0 ] && [ "$MEM_TOTAL_KIB" -lt $((6 * 1024 * 1024)) ]; then
                 echo ""
                 echo -e "   ${YELLOW}This machine has $((MEM_TOTAL_KIB / 1024 / 1024)) GiB RAM — 'aggressive' (4 GiB) is NOT safe"
@@ -1376,6 +1388,12 @@ convert_luks1() {
                 warn "    cryptsetup luksConvertKey -S $slot --hash sha512 --pbkdf argon2id $dev"
             fi
         done
+    elif [ "$GRUB_RECOST" != "none" ]; then
+        echo ""
+        warn "  Re-costing deferred. The keyslots are still pbkdf2 — a plain for loop"
+        warn "  over a hash with no memory cost — so this volume is NOT hardened yet."
+        warn "  pbkdf2 is never an option in LinuxLocker; re-run this script or"
+        warn "  luks-tune.sh and convert every slot to argon2id before relying on it."
     fi
 
     echo ""

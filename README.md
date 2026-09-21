@@ -434,7 +434,8 @@ LUKS_UNMOUNT=yes|no                        unmount a target a live desktop mount
 LUKS_RESUME=yes|no                         finish an interrupted encryption
 LUKS_EXISTING=tune|config|quit             what to do with a finished LUKS2 volume
 LUKS_PROFILE=...|skip                      also answers the re-costing menu after a
-                                           LUKS1 conversion ('skip' keeps pbkdf2)
+                                           LUKS1 conversion ('skip' defers it —
+                                           pbkdf2 is never an option)
 LUKS_DATA_PARTITION=yes|no                 encrypt a volume with no fstab as data
 LUKS_MISMATCH_OVERRIDE=MISMATCH            keep a pinned /boot or EFI the target's
                                            fstab disagrees with
@@ -558,9 +559,14 @@ match the target.
 
 ### Why argon2id only, and never pbkdf2?
 
-pbkdf2 is CPU-only, which is exactly what a GPU cracking fleet is good at.
-argon2id is memory-hard, so an attacker has to buy RAM per guess, not just
-cores. All three profiles are argon2id, and the cheapest of them is a hard
+pbkdf2 is a simple `for` loop: hash the passphrase, feed the result back in,
+repeat. It holds no state larger than one hash, so it needs no memory, and
+that is exactly what a GPU cracking fleet is good at — every core runs its
+own copy of the loop. argon2id is memory-hard, so an attacker has to buy RAM
+per guess, not just cores. **pbkdf2 is never an option here.** LinuxLocker
+never writes it, never offers it, and treats a keyslot still on it as not
+yet hardened: the `skip` choice after a LUKS1 conversion only defers the
+re-costing, and the script says so before it lets you leave. All three profiles are argon2id, and the cheapest of them is a hard
 floor with no override flag — the tool exists to beat a bare `luksFormat`, not
 to undercut it. `luks-tune.sh` also converts leftover pbkdf2 keyslots on
 volumes you encrypted earlier. For what the same loop looks like in BitLocker
