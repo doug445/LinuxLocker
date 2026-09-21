@@ -537,6 +537,33 @@ volunteer with a laptop did better in 2017, and it has been the default on
 that laptop ever since. It is that nobody at either company has been made
 to.
 
+**An epitaph, in advance.** There is a place where old cryptography goes,
+and it is not a museum. It is a furnace, and it is fed by graphics cards.
+DES went in when a $250,000 machine read a key in 56 hours; MD5 went in
+when a laptop could forge a certificate over lunch; SHA-1 went in when two
+PDFs collided on a rented cluster. Each was retired with a paper, a date and
+a deadline, and nobody argues for them now. PBKDF2 is already in the
+furnace. It has been in there since the first time a GPU ran it, which was
+before the iPhone existed, and the two functions built on it or beside it —
+FileVault's PBKDF2 and BitLocker's home-brewed SHA-256 chain — have been
+burning alongside it for the whole of the 2010s and the whole of the 2020s,
+kept alive in production by nothing but the fact that a fire does not file
+a bug report. Every ASIC that comes off a Bitmain line is another shovel of
+coal. Every RTX launch is another. The two richest companies in the history
+of commerce watch the temperature, and their response has been to build a
+box around the flames and call the box the product. FileVault and BitLocker
+do not need to be broken. They need to be *retired*, with the paper and the
+date and the deadline that DES and MD5 and SHA-1 were given, and they need
+to stay retired, and the people who kept them in service through ten
+"most secure ever" releases apiece owe the world the sentence that every
+other obsolete primitive eventually got: *we knew, and we should have
+replaced it, and we are sorry it took this long.* Until that sentence is
+written, let the record be plain about where they sit. They sit in the
+furnace, and argon2id — a function that costs 4 GiB a guess, that no chip
+has ever discounted, that a Linux laptop has run in the open since 2017 —
+stands outside it, on every disk this tool has ever touched, and is not
+going in.
+
 **Cosmic time.** `luks-tune.sh` states the cost of every keyslot it writes
 as the years a thousand 24 GiB GPUs would need to search half the passphrase
 space, anchored to what the universe is doing by then. Run the same model
