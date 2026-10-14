@@ -198,12 +198,16 @@ Requirements for any patch:
 `tests/loopback-core-test.sh` exercises the encryption core against file-backed
 loop devices: shrink guards, in-place re-encryption, `--resume-only`, a hard kill
 mid-re-encryption followed by `cryptsetup repair`, recovery keys, the ext4 path,
-and LUKS1 → LUKS2 conversion. It needs root and touches no real disk.
+LUKS1 → LUKS2 conversion, and a GPT image laid out like an Apple Silicon disk
+that `luks-deploy.sh` must refuse before touching its LUKS root. It needs root
+and touches no real disk.
 
 `tests/uki-fixture-test.sh` exercises the UKI, systemd-boot and Secure Boot
 logic against synthetic target trees: every ESP layout, every rebuild backend,
 every signer, the refusal matrix, `.cmdline` round-trips through a real PE
-binary, and the Fedora Asahi Remix guard. It needs neither root nor a disk.
+binary, and the Fedora Asahi Remix guard — the machine check, the partition
+check against fake disks, and every copy of both against `lib-deps.sh`. It
+needs neither root nor a disk.
 
 Both run in CI on x86_64 and aarch64 for every push.
 
@@ -216,10 +220,15 @@ diagnostics.
 ## Apple Silicon
 
 Bugs about Fedora Asahi Remix belong in
-[AsahiLocker](https://github.com/doug445/AsahiLocker), not here. LinuxLocker
-detects Asahi and Apple Silicon hardware and refuses before touching any device;
-if that refusal *fails to fire* on an Asahi system, that is a LinuxLocker bug and
-a serious one — please report it here with a diagnostic bundle.
+[AsahiLocker](https://github.com/doug445/AsahiLocker), not here.
+`linuxlocker.sh`, `luks-deploy.sh`, `luks-tune.sh` and `post-encryption-setup.sh`
+refuse a machine running Asahi, or any Apple Silicon hardware, before touching
+any device, and `luks-deploy.sh` and `luks-tune.sh` refuse an Asahi disk
+attached to another machine before doing anything to it;
+[docs/BOOTLOADERS.md](docs/BOOTLOADERS.md#apple-silicon) states exactly what
+that check reads and the one case it cannot see. If a refusal *fails to fire*
+where that page says it will, that is a LinuxLocker bug and a serious one —
+please report it here with a diagnostic bundle.
 
 ## Conduct
 

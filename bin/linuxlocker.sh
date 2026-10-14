@@ -68,24 +68,91 @@ case "${1:-}" in
     *) echo "linuxlocker.sh: unknown action '$1' (deploy|tune|post|bundle|diag, or --help)" >&2; exit 2 ;;
 esac
 
-[ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo $0 ${ACTION}" >&2; exit 1; }
-
 # shellcheck source=lib-deps.sh
 . "$SCRIPT_DIR/lib-deps.sh"
 
-# The diagnostic bundle runs before every other gate — including the Asahi
-# refusal and the dependency installer. Its job is to describe a machine that
-# is already in the wrong state, so it must never be the thing that refuses.
-if [ "$ACTION" = "diag" ]; then
-    exec "$SCRIPT_DIR/linuxlocker-diag.sh" "$@"
-fi
-
 # ─── Apple Silicon / Fedora Asahi Remix — wrong tool ─────────────────────────
-# Checked at the front door as well as in luks-deploy.sh, so `linuxlocker.sh
-# post` and `bundle` stop here too rather than half-configuring an Asahi box.
-if ll_detect_asahi ""; then
+# Checked at the front door as well as in luks-deploy.sh, luks-tune.sh and
+# post-encryption-setup.sh, so `linuxlocker.sh bundle` stops here too rather
+# than describing an Asahi box with the wrong tool. Checked before the root
+# check, as those three do, so it is the first thing an Asahi user sees.
+#
+# lib-deps.sh holds the canonical ll_detect_asahi / ll_asahi_refuse. One from
+# before 1.2.0 has neither, and calling the missing function printed "command
+# not found" and carried on; the identical copy below stands in when they are
+# missing. tests/uki-fixture-test.sh fails if it stops matching lib-deps.sh.
+# --- asahi_guard ---
+if ! declare -F ll_detect_asahi >/dev/null || ! declare -F ll_asahi_refuse >/dev/null; then
+    LL_ASAHI_REASON=""
+    LL_ASAHILOCKER_URL="https://github.com/doug445/AsahiLocker"
+    ll_detect_asahi() {
+        local root="${1%/}" rel v d
+        LL_ASAHI_REASON=""
+        rel="$root/etc/os-release"
+        [ -r "$rel" ] || rel="$root/usr/lib/os-release"
+        if [ -r "$rel" ]; then
+            v=$(grep -Ei '^(NAME|PRETTY_NAME|VARIANT|VARIANT_ID|ID)=' "$rel" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            case "$v" in
+                *asahi*) LL_ASAHI_REASON="os-release identifies Fedora Asahi Remix"; return 0 ;;
+            esac
+        fi
+        for d in "$root"/usr/lib/modules/*asahi*/ "$root"/lib/modules/*asahi*/; do
+            [ -d "$d" ] || continue
+            LL_ASAHI_REASON="Asahi kernel installed ($(basename "$d"))"
+            return 0
+        done
+        for d in "$root"/boot/efi/m1n1 "$root"/etc/default/m1n1 "$root"/usr/lib/asahi-boot; do
+            [ -e "$d" ] || continue
+            LL_ASAHI_REASON="m1n1 / asahi boot components present (${d#"$root"})"
+            return 0
+        done
+        if [ -z "$root" ] && [ -r /proc/device-tree/compatible ]; then
+            if tr -d '\0' < /proc/device-tree/compatible 2>/dev/null | grep -q 'apple,'; then
+                LL_ASAHI_REASON="this machine is Apple Silicon (device-tree reports apple,*)"
+                return 0
+            fi
+        fi
+        return 1
+    }
+    ll_link() {
+        printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$2"
+    }
+    ll_asahi_refuse() {
+        echo ""
+        echo "╔════════════════════════════════════════════════════════════╗"
+        echo "║  WRONG TOOL — use AsahiLocker for Fedora Asahi Remix       ║"
+        echo "╚════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "  ${1:-Detected an Apple Silicon / Fedora Asahi Remix system.}"
+        [ -n "$LL_ASAHI_REASON" ] && echo "  Reason: $LL_ASAHI_REASON"
+        echo ""
+        echo "  LinuxLocker deliberately drops the Asahi boot guards, because on"
+        echo "  every other platform they are dead weight. Apple Silicon boots"
+        echo "  iBoot -> m1n1 -> U-Boot -> GRUB, and its stub partitions are read"
+        echo "  by the Apple firmware itself. Running this script here would"
+        echo "  misidentify the boot chain and could leave the machine unbootable"
+        echo "  in a way macOS recovery cannot fix for you."
+        echo ""
+        printf '  Use AsahiLocker instead:  '
+        ll_link "$LL_ASAHILOCKER_URL" "$LL_ASAHILOCKER_URL"
+        printf '\n\n'
+        echo "      git clone $LL_ASAHILOCKER_URL"
+        echo ""
+    }
+fi
+# --- end asahi_guard ---
+# The diagnostic bundle is the one action exempt: its job is to describe a
+# machine that is already in the wrong state, so it must never be the thing
+# that refuses. It still runs before the dependency installer.
+if [ "$ACTION" != "diag" ] && ll_detect_asahi ""; then
     ll_asahi_refuse "This machine is Apple Silicon / Fedora Asahi Remix."
     exit 3
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo $0 ${ACTION}" >&2; exit 1; }
+
+if [ "$ACTION" = "diag" ]; then
+    exec "$SCRIPT_DIR/linuxlocker-diag.sh" "$@"
 fi
 
 echo "════════════════════════════════════════════════════════════"

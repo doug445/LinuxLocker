@@ -27,19 +27,19 @@
             "context": "shellcheck"
           },
           {
-            "context": "loopback (ubuntu-latest)"
+            "context": "loopback (ubuntu-24.04)"
           },
           {
             "context": "loopback (ubuntu-24.04-arm)"
           },
           {
-            "context": "uki-fixtures (ubuntu-latest)"
+            "context": "uki-fixtures (ubuntu-24.04)"
           },
           {
             "context": "uki-fixtures (ubuntu-24.04-arm)"
           },
           {
-            "context": "cmdline-fixtures (ubuntu-latest)"
+            "context": "cmdline-fixtures (ubuntu-24.04)"
           },
           {
             "context": "cmdline-fixtures (ubuntu-24.04-arm)"

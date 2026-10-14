@@ -231,6 +231,87 @@ if ll_detect_asahi ""; then
     ll_asahi_refuse "This live environment is running on Apple Silicon / Fedora Asahi Remix."
     exit 3
 fi
+# The partition you select gets its own check, before anything is done to it
+# (see "the partition you selected", below). That check cannot unlock a LUKS
+# volume, so it reads what the disk shows on the outside: lib-deps.sh's
+# ll_detect_asahi_dev, with the identical copy below standing in when it is
+# not loaded. luks-tune.sh carries the same block; the same test keeps both.
+# --- asahi_dev_guard ---
+if ! declare -F ll_detect_asahi_dev >/dev/null; then
+    ll_detect_asahi_dev() {
+        local dev="$1" self disk path type fs mp sub tmp opts hit k
+        LL_ASAHI_REASON=""
+        self=$(lsblk -dnpo NAME "$dev" 2>/dev/null | head -n 1)
+        [ -n "$self" ] || self="$dev"
+        disk=$(lsblk -dno PKNAME "$dev" 2>/dev/null | head -n 1)
+        if [ -n "$disk" ]; then
+            while read -r path type; do
+                case "${type,,}" in
+                    69646961-6700-11aa-aa11-00306543ecac)
+                        LL_ASAHI_REASON="its disk carries an Apple Silicon boot partition ($path, iBootSystemContainer)"
+                        return 0 ;;
+                    52637672-7900-11aa-aa11-00306543ecac)
+                        LL_ASAHI_REASON="its disk carries an Apple Silicon recovery partition ($path, RecoveryOSContainer)"
+                        return 0 ;;
+                esac
+            done < <(lsblk -rpno NAME,PARTTYPE "/dev/$disk" 2>/dev/null)
+        fi
+        while read -r path; do
+            [ -n "$path" ] || continue
+            while read -r mp; do
+                [ -n "$mp" ] || continue
+                for sub in "" root @rootfs @; do
+                    if ll_detect_asahi "${mp%/}${sub:+/$sub}"; then
+                        LL_ASAHI_REASON="it is mounted at $mp, and $LL_ASAHI_REASON"
+                        return 0
+                    fi
+                done
+            done < <(findmnt -lno TARGET -S "$path" 2>/dev/null)
+        done < <(lsblk -rpno NAME "$dev" 2>/dev/null)
+        if [ -n "$disk" ]; then
+            while read -r path type fs; do
+                [ "$type" = part ] && [ "$path" != "$self" ] || continue
+                case "$fs" in
+                    vfat)      opts=ro ;;
+                    ext3|ext4) opts=ro,noload ;;
+                    ext2)      opts=ro ;;
+                    *)         continue ;;
+                esac
+                mp=$(findmnt -lno TARGET -S "$path" 2>/dev/null | head -n 1)
+                tmp=""
+                if [ -z "$mp" ]; then
+                    tmp=$(mktemp -d /tmp/luks-asahi-probe.XXXXXX) || continue
+                    if mount -t "$fs" -o "$opts" "$path" "$tmp" 2>/dev/null; then
+                        mp="$tmp"
+                    else
+                        rmdir "$tmp" 2>/dev/null
+                        continue
+                    fi
+                fi
+                hit=""
+                if [ "$fs" = vfat ]; then
+                    [ -e "$mp/m1n1" ] && hit="m1n1 on the FAT partition $path"
+                else
+                    for k in "$mp"/vmlinuz-*asahi* "$mp"/boot/vmlinuz-*asahi*; do
+                        [ -e "$k" ] || continue
+                        hit="an Asahi kernel on $path ($(basename "$k"))"
+                        break
+                    done
+                fi
+                if [ -n "$tmp" ]; then
+                    umount "$tmp" 2>/dev/null
+                    rmdir "$tmp" 2>/dev/null
+                fi
+                if [ -n "$hit" ]; then
+                    LL_ASAHI_REASON="its disk holds $hit"
+                    return 0
+                fi
+            done < <(lsblk -rpno NAME,TYPE,FSTYPE "/dev/$disk" 2>/dev/null)
+        fi
+        return 1
+    }
+fi
+# --- end asahi_dev_guard ---
 
 # ─── UKI / systemd-boot / Secure Boot support ────────────────────────────────
 # Optional in the same way: without lib-uki.sh a UKI target is refused outright
@@ -791,7 +872,7 @@ cleanup() {
     # inside /mnt_temp, and a plain umount would fail on the child mount)
     umount -R /mnt_temp 2>/dev/null || umount /mnt_temp 2>/dev/null || true
     rmdir /mnt_temp 2>/dev/null || true
-    for uki_probe_dir in /tmp/luks-uki-probe.* /tmp/luks-grub-probe.*; do
+    for uki_probe_dir in /tmp/luks-uki-probe.* /tmp/luks-grub-probe.* /tmp/luks-asahi-probe.*; do
         [ -d "$uki_probe_dir" ] || continue
         umount "$uki_probe_dir" 2>/dev/null || true
         rmdir "$uki_probe_dir" 2>/dev/null || true
@@ -840,6 +921,13 @@ trap cleanup EXIT
 # ─── Partial Previous Run Detection ─────────────────────────────────────────
 # If a previous run was interrupted, detect and warn
 if [ -b /dev/mapper/${LUKS_NAME} ]; then
+    # What is behind it gets the same Asahi check as a selected partition,
+    # before this run unmounts or closes anything of it.
+    STALE_BACKING=$(cryptsetup status "${LUKS_NAME}" 2>/dev/null | awk '$1 == "device:" {print $2; exit}')
+    if [ -n "$STALE_BACKING" ] && ll_detect_asahi_dev "$STALE_BACKING"; then
+        ll_asahi_refuse "/dev/mapper/${LUKS_NAME}, left open by an earlier run, belongs to an Apple Silicon / Fedora Asahi Remix system."
+        exit 3
+    fi
     warn "Found /dev/mapper/${LUKS_NAME} already open from a previous run!"
     echo "  keep  = leave it open and reuse it (saves a passphrase prompt in config-only mode)"
     echo "  close = close it and start fresh"
@@ -1102,6 +1190,20 @@ if [ -n "$LIVE_ROOT_REAL" ] && [ "$TARGET_ROOT_REAL" = "$LIVE_ROOT_REAL" ]; then
     fatal "$TARGET_ROOT is the live environment's own root device. Pick the installed system's partition."
 fi
 
+# ─── Apple Silicon / Fedora Asahi Remix — the partition you selected ─────────
+# The live environment was checked at the top; an Asahi disk carried over to
+# another machine is checked here, before anything is done to the partition:
+# before it is unmounted, converted, resumed, handed to luks-tune.sh, shrunk,
+# encrypted or reconfigured. Nothing here needs its passphrase — the disk's
+# partition types, anything already mounted from it, and the plain partitions
+# beside it (ll_detect_asahi_dev). Its own filesystem is checked as well, at
+# the first point this run can read it: the read-only look before a LUKS1
+# conversion, and discovery below.
+if ll_detect_asahi_dev "$TARGET_ROOT"; then
+    ll_asahi_refuse "The partition you selected belongs to an Apple Silicon / Fedora Asahi Remix system."
+    exit 3
+fi
+
 # ─── Stale Mapper Cross-Check ────────────────────────────────────────────────
 # If ${LUKS_NAME} is open (e.g. kept from a previous run), it MUST be backed by
 # the ROOT partition just selected. Otherwise every later step that reuses the
@@ -1215,16 +1317,21 @@ convert_luks1() {
         log "  Checking whether GRUB itself unlocks this volume — it is opened read-only"
         log "  for a look at its fstab (enter the passphrase)..."
         if cryptsetup open --readonly "${CRYPT_PASS_ARGS[@]}" "$dev" "luks-probe-$$"; then
-            local pfs psub="" ptry
+            # The same look is the first sight of the system inside the
+            # volume, so the Asahi check runs on it too, before the header
+            # is converted (the outside checks ran when it was selected).
+            local pfs psub="" ptry asahi_inside=0
             pfs=$(blkid -s TYPE -o value "/dev/mapper/luks-probe-$$" 2>/dev/null || echo "")
             mkdir -p /mnt_temp
             if [ "$pfs" = "btrfs" ] && mount -o ro,subvolid=5 "/dev/mapper/luks-probe-$$" /mnt_temp 2>/dev/null; then
                 for ptry in root @rootfs @ ""; do
                     [ -f "/mnt_temp/${ptry}${ptry:+/}etc/fstab" ] && { psub="${ptry}${ptry:+/}"; break; }
                 done
+                if ll_detect_asahi "/mnt_temp/${psub%/}"; then asahi_inside=1; fi
                 bt_grub_probe "$dev" "/mnt_temp/${psub%/}"
                 umount /mnt_temp
             elif [ -n "$pfs" ] && mount -o ro "/dev/mapper/luks-probe-$$" /mnt_temp 2>/dev/null; then
+                if ll_detect_asahi /mnt_temp; then asahi_inside=1; fi
                 bt_grub_probe "$dev" /mnt_temp
                 umount /mnt_temp
             else
@@ -1232,6 +1339,10 @@ convert_luks1() {
             fi
             rmdir /mnt_temp 2>/dev/null || true
             cryptsetup close "luks-probe-$$"
+            if [ "$asahi_inside" -eq 1 ]; then
+                ll_asahi_refuse "The LUKS1 volume you selected holds a Fedora Asahi Remix install."
+                exit 3
+            fi
         else
             fatal "Could not open $dev — wrong passphrase? Header unchanged."
         fi
@@ -1854,7 +1965,10 @@ if [ "$SYSTEM_MODE" -eq 1 ]; then
 
     # The TARGET may be Fedora Asahi Remix even when the live environment is
     # not (an Asahi disk read from another machine, a rescue image that does
-    # not identify itself). ID=fedora, so only the variant fields catch it.
+    # not identify itself). This is the first sight of the filesystem itself;
+    # its os-release names Asahi in NAME and ID (44: ID=fedora-asahi-remix),
+    # VARIANT_ID holds only the desktop edition. Refused here, before any
+    # shrink, encryption or configuration.
     if ll_detect_asahi "/mnt_temp/${SUBPATH%/}"; then
         ll_asahi_refuse "The partition you selected holds a Fedora Asahi Remix install."
         exit 3

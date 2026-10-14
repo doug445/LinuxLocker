@@ -203,6 +203,9 @@ ll_ensure_tools() {
 #   ll_detect_asahi <rootdir>   0 = this is Asahi / Apple Silicon; sets
 #                               LL_ASAHI_REASON. <rootdir> may be "" for the
 #                               live environment.
+#   ll_detect_asahi_dev <dev>   0 = <dev> belongs to an Apple Silicon / Asahi
+#                               system, judged without unlocking it; sets
+#                               LL_ASAHI_REASON. See its own comment.
 #   ll_asahi_refuse <context>   print the refusal with a clickable link.
 
 LL_ASAHI_REASON=""
@@ -212,8 +215,11 @@ ll_detect_asahi() {
     local root="${1%/}" rel v d
     LL_ASAHI_REASON=""
 
-    # 1. os-release. Fedora Asahi Remix keeps ID=fedora and marks itself in
-    #    VARIANT_ID / VARIANT / NAME, so ID alone never catches it.
+    # 1. os-release. Fedora Asahi Remix names itself in NAME and ID — 44 ships
+    #    NAME="Fedora Linux Asahi Remix", ID=fedora-asahi-remix, ID_LIKE=fedora
+    #    — while VARIANT_ID holds only the desktop edition (kde), so the
+    #    variant fields alone never catch it. NAME, PRETTY_NAME, VARIANT,
+    #    VARIANT_ID and ID are all read.
     rel="$root/etc/os-release"
     [ -r "$rel" ] || rel="$root/usr/lib/os-release"
     if [ -r "$rel" ]; then
@@ -244,6 +250,102 @@ ll_detect_asahi() {
             LL_ASAHI_REASON="this machine is Apple Silicon (device-tree reports apple,*)"
             return 0
         fi
+    fi
+
+    return 1
+}
+
+# ll_detect_asahi_dev <dev> — the partition (or volume) about to be acted on,
+# judged WITHOUT unlocking it, so it can run before anything is done to it.
+# The live check above cannot see a disk carried over from an Asahi system;
+# this looks at what such a disk shows on the outside:
+#   1. Apple Silicon system partitions on the same disk. util-linux names the
+#      GPT types "Apple Silicon boot" (iBootSystemContainer) and "Apple
+#      Silicon recovery" (RecoveryOSContainer); an Apple Silicon Mac's disk
+#      carries both, beside macOS and the Asahi stub.
+#   2. A filesystem already mounted from it, or from a mapper open on it (an
+#      automounting desktop, a mapper kept from an earlier run): read where
+#      it already is, as the root and as the btrfs subvolumes discovery tries.
+#   3. The plain partitions beside it: m1n1 at the top of a FAT partition
+#      (the Asahi ESP holds m1n1/), or a kernel whose release names asahi on
+#      an ext2/3/4 one (Fedora Asahi Remix keeps /boot plain ext4, and
+#      AsahiLocker leaves it so). Read through an existing mountpoint, else a
+#      read-only probe mount — noload on ext3/4, so no journal is replayed.
+#      The selected partition itself is never probe-mounted here.
+# What none of this can see: a volume that is already LUKS, with nothing
+# Asahi outside it. Its own filesystem is checked once something unlocks it.
+ll_detect_asahi_dev() {
+    local dev="$1" self disk path type fs mp sub tmp opts hit k
+    LL_ASAHI_REASON=""
+    self=$(lsblk -dnpo NAME "$dev" 2>/dev/null | head -n 1)
+    [ -n "$self" ] || self="$dev"
+    disk=$(lsblk -dno PKNAME "$dev" 2>/dev/null | head -n 1)
+
+    if [ -n "$disk" ]; then
+        while read -r path type; do
+            case "${type,,}" in
+                69646961-6700-11aa-aa11-00306543ecac)
+                    LL_ASAHI_REASON="its disk carries an Apple Silicon boot partition ($path, iBootSystemContainer)"
+                    return 0 ;;
+                52637672-7900-11aa-aa11-00306543ecac)
+                    LL_ASAHI_REASON="its disk carries an Apple Silicon recovery partition ($path, RecoveryOSContainer)"
+                    return 0 ;;
+            esac
+        done < <(lsblk -rpno NAME,PARTTYPE "/dev/$disk" 2>/dev/null)
+    fi
+
+    while read -r path; do
+        [ -n "$path" ] || continue
+        while read -r mp; do
+            [ -n "$mp" ] || continue
+            for sub in "" root @rootfs @; do
+                if ll_detect_asahi "${mp%/}${sub:+/$sub}"; then
+                    LL_ASAHI_REASON="it is mounted at $mp, and $LL_ASAHI_REASON"
+                    return 0
+                fi
+            done
+        done < <(findmnt -lno TARGET -S "$path" 2>/dev/null)
+    done < <(lsblk -rpno NAME "$dev" 2>/dev/null)
+
+    if [ -n "$disk" ]; then
+        while read -r path type fs; do
+            [ "$type" = part ] && [ "$path" != "$self" ] || continue
+            case "$fs" in
+                vfat)      opts=ro ;;
+                ext3|ext4) opts=ro,noload ;;
+                ext2)      opts=ro ;;
+                *)         continue ;;
+            esac
+            mp=$(findmnt -lno TARGET -S "$path" 2>/dev/null | head -n 1)
+            tmp=""
+            if [ -z "$mp" ]; then
+                tmp=$(mktemp -d /tmp/luks-asahi-probe.XXXXXX) || continue
+                if mount -t "$fs" -o "$opts" "$path" "$tmp" 2>/dev/null; then
+                    mp="$tmp"
+                else
+                    rmdir "$tmp" 2>/dev/null
+                    continue
+                fi
+            fi
+            hit=""
+            if [ "$fs" = vfat ]; then
+                [ -e "$mp/m1n1" ] && hit="m1n1 on the FAT partition $path"
+            else
+                for k in "$mp"/vmlinuz-*asahi* "$mp"/boot/vmlinuz-*asahi*; do
+                    [ -e "$k" ] || continue
+                    hit="an Asahi kernel on $path ($(basename "$k"))"
+                    break
+                done
+            fi
+            if [ -n "$tmp" ]; then
+                umount "$tmp" 2>/dev/null
+                rmdir "$tmp" 2>/dev/null
+            fi
+            if [ -n "$hit" ]; then
+                LL_ASAHI_REASON="its disk holds $hit"
+                return 0
+            fi
+        done < <(lsblk -rpno NAME,TYPE,FSTYPE "/dev/$disk" 2>/dev/null)
     fi
 
     return 1

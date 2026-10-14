@@ -30,11 +30,18 @@
 #   7.  detection against THIS machine matches what it really runs, when this
 #       machine is itself a UKI target (skipped everywhere else)
 #   8.  the Fedora Asahi Remix guard: every signal it reads; the copies that
-#       luks-deploy.sh, luks-tune.sh and post-encryption-setup.sh carry are
-#       identical to lib-deps.sh's and give the same verdicts; no check is
-#       gated on a library being present; and each script, run unprivileged
-#       with no lib-deps.sh beside it, refuses on an Asahi / Apple Silicon
-#       machine and gets past the check cleanly everywhere else
+#       luks-deploy.sh, luks-tune.sh, post-encryption-setup.sh and
+#       linuxlocker.sh carry are identical to lib-deps.sh's and give the same
+#       verdicts; no check is gated on a library being present; and each
+#       script, run unprivileged with no lib-deps.sh (or a pre-1.2.0 one)
+#       beside it, refuses on an Asahi / Apple Silicon machine and gets past
+#       the check cleanly everywhere else
+#   9.  the partition check (ll_detect_asahi_dev) against fake disks with
+#       lsblk/findmnt/mount mocked — Apple Silicon partition types, mounted
+#       filesystems, m1n1 / an Asahi kernel on the plain partitions beside it,
+#       the read-only probe options — its copies in luks-deploy.sh and
+#       luks-tune.sh, the line order that puts it before every action on the
+#       selected partition, and this machine's own disks when one is Apple's
 #
 # Run:  bash tests/uki-fixture-test.sh        (no root, no disk, no network)
 # ============================================================================
@@ -323,6 +330,9 @@ fi
 # ─── 9. Apple Silicon / Fedora Asahi Remix guard ─────────────────────────────
 echo ""
 echo "[9] Fedora Asahi Remix detection"
+# A synthetic os-release that names Asahi everywhere but ID (a real Fedora
+# Asahi Remix 44 has ID=fedora-asahi-remix and VARIANT_ID=kde — see the f44
+# fixture below): detection must not depend on any one field.
 A="$TMP/asahi"; mkdir -p "$A/etc"
 cat > "$A/etc/os-release" <<'OSR'
 NAME="Fedora Linux Asahi Remix"
@@ -330,8 +340,8 @@ ID=fedora
 VARIANT="Asahi Remix"
 VARIANT_ID=asahi
 OSR
-if ll_detect_asahi "$A"; then pass "Fedora Asahi Remix detected via VARIANT_ID"
-else fail "Fedora Asahi Remix NOT detected (ID=fedora alone must not fool it)"; fi
+if ll_detect_asahi "$A"; then pass "Asahi named in NAME/VARIANT/VARIANT_ID with ID=fedora is detected"
+else fail "Asahi named in NAME/VARIANT/VARIANT_ID with ID=fedora was NOT detected"; fi
 
 F="$TMP/plainfedora"; mkdir -p "$F/etc"
 printf 'NAME="Fedora Linux"\nID=fedora\nVARIANT_ID=workstation\n' > "$F/etc/os-release"
@@ -387,10 +397,12 @@ done
 ALL_FX=("$A" "$F" "$M" "${FX_ROOTS[@]}")
 
 # ─── 9b. The copies of the guard agree with lib-deps.sh ──────────────────────
-# luks-deploy.sh, luks-tune.sh and post-encryption-setup.sh each carry the
-# guard between '# --- asahi_guard ---' markers, so the refusal still fires
-# when lib-deps.sh was not copied along (until 1.6.4 luks-deploy.sh skipped it
-# silently then). Each block is loaded into a fresh bash holding nothing else
+# luks-deploy.sh, luks-tune.sh, post-encryption-setup.sh and linuxlocker.sh
+# each carry the guard between '# --- asahi_guard ---' markers, so the refusal
+# still fires when lib-deps.sh was not copied along, or is a pre-1.2.0 one
+# without the guard (until 1.6.4 luks-deploy.sh skipped it silently then, and
+# until 1.6.5 linuxlocker.sh printed "command not found" and carried on).
+# Each block is loaded into a fresh bash holding nothing else
 # and compared with lib-deps.sh: the functions as bash itself prints them
 # (comments and layout ignored), then the verdict and the reason on every
 # fixture above and on this machine.
@@ -414,7 +426,7 @@ guard_block() {   # $1 = script under bin/ -> its asahi_guard block
 CANON=". \"$REPO/bin/lib-deps.sh\""
 CANON_DEFS=$(guard_defs "$CANON")
 CANON_VERDICTS=$(guard_verdicts "$CANON" "${ALL_FX[@]}" "")
-for s in luks-deploy.sh luks-tune.sh post-encryption-setup.sh; do
+for s in luks-deploy.sh luks-tune.sh post-encryption-setup.sh linuxlocker.sh; do
     BLOCK=$(guard_block "$s")
     if [ -z "$BLOCK" ]; then fail "$s: no '# --- asahi_guard ---' block"; continue; fi
     GOT=$(guard_defs "$BLOCK")
@@ -533,6 +545,262 @@ else
     cp "$REPO/bin/post-encryption-setup.sh" "$D/"
     run_alone "$D" post-encryption-setup.sh
     check_alone "post-encryption-setup.sh entirely alone" 1 'run as root'
+    # The front door cannot run without lib-deps.sh at all; what it must
+    # survive is a pre-1.2.0 one, whose missing detector used to print
+    # "command not found" and let the run carry on.
+    D="$TMP/stale-front"; mkdir -p "$D"
+    cp "$REPO/bin/linuxlocker.sh" "$D/"
+    cp "$STALE_LIB" "$D/lib-deps.sh"
+    run_alone "$D" linuxlocker.sh
+    check_alone "linuxlocker.sh beside a guard-less (pre-1.2.0) lib-deps.sh" 1 'Run as root'
+    D="$TMP/front"; mkdir -p "$D"
+    cp "$REPO/bin/linuxlocker.sh" "$REPO/bin/lib-deps.sh" "$D/"
+    run_alone "$D" linuxlocker.sh
+    check_alone "linuxlocker.sh beside lib-deps.sh" 1 'Run as root'
+fi
+
+# ─── 9e. The partition check, against fake disks ─────────────────────────────
+# ll_detect_asahi_dev judges the partition about to be acted on without its
+# passphrase: Apple Silicon partition types on its disk, filesystems already
+# mounted from it, and the plain partitions beside it (m1n1 on a FAT one, an
+# Asahi kernel on an ext2/3/4 one), probe-mounted read-only when not mounted.
+# It reads all of that through lsblk, findmnt and mount; here those commands
+# (and umount) are shell functions answering from a table, so the real
+# function runs unmodified, with no root and no block device. Each table row:
+#   path|parent name|type|parttype|fstype|mountpoint|what a probe mount shows
+# The probe mounts are logged with their options, so the log is checked too:
+# vfat ro, ext3/4 ro,noload (no journal replay), and never the selected
+# partition itself. The copies in luks-deploy.sh and luks-tune.sh must give
+# exactly what lib-deps.sh gives, case by case.
+echo ""
+echo "[9e] The partition check, against fake disks (lsblk/findmnt/mount mocked)"
+MK="$TMP/devfx"; C="$MK/content"
+mkdir -p "$C/esp-m1n1/m1n1" "$C/esp-m1n1/EFI/BOOT" "$C/esp-plain/EFI/BOOT" "$C/esp-ubuntu/EFI/ubuntu" \
+         "$C/boot-asahi" "$C/boot-generic" "$C/btrfs-top/root/etc" "$C/btrfs-top/home" "$C/root-asahi/etc"
+: > "$C/esp-m1n1/m1n1/boot.bin"; : > "$C/esp-m1n1/EFI/BOOT/BOOTAA64.EFI"
+: > "$C/esp-plain/EFI/BOOT/BOOTAA64.EFI"; : > "$C/esp-ubuntu/EFI/ubuntu/grubx64.efi"
+: > "$C/boot-asahi/vmlinuz-7.1.13-402.asahi.fc44.aarch64+16k"
+: > "$C/boot-asahi/config-7.1.13-402.asahi.fc44.aarch64+16k"
+: > "$C/boot-generic/vmlinuz-6.8.0-45-generic"
+printf 'NAME="Fedora Linux Asahi Remix"\nID=fedora-asahi-remix\nVARIANT_ID=kde\n' > "$C/btrfs-top/root/etc/os-release"
+cp "$C/btrfs-top/root/etc/os-release" "$C/root-asahi/etc/os-release"
+BOOT_T=c12a7328-f81f-11d2-ba4b-00a0c93ec93b; LIN_T=0fc63daf-8483-4772-8e79-3d69d8477de4
+APFS_T=7c3457ef-0000-11aa-aa11-00306543ecac
+IBOOT_T=69646961-6700-11aa-aa11-00306543ecac; RECOV_T=52637672-7900-11aa-aa11-00306543ecac
+spec() {   # $1 = case name, rest = rows
+    local n="$1"; shift
+    printf '%s\n' "$@" > "$MK/$n.spec"
+}
+# The layout of a real Apple Silicon Mac running Fedora Asahi Remix (the
+# author's M2 Max, read with lsblk): iBoot system container, macOS, the Asahi
+# stub, the ESP, /boot, the LUKS root, the recovery container.
+spec apple "/dev/fk1||disk|-|-|-|-" "/dev/fk1p1|fk1|part|$IBOOT_T|apfs|-|-" \
+    "/dev/fk1p2|fk1|part|$APFS_T|apfs|-|-" "/dev/fk1p3|fk1|part|$APFS_T|apfs|-|-" \
+    "/dev/fk1p4|fk1|part|$BOOT_T|vfat|-|$C/esp-m1n1" "/dev/fk1p5|fk1|part|$LIN_T|ext4|-|$C/boot-asahi" \
+    "/dev/fk1p6|fk1|part|$LIN_T|crypto_LUKS|-|-" "/dev/fk1p7|fk1|part|$RECOV_T|apfs|-|-"
+spec recovery "/dev/fk2||disk|-|-|-|-" "/dev/fk2p1|fk2|part|$APFS_T|apfs|-|-" \
+    "/dev/fk2p2|fk2|part|$LIN_T|crypto_LUKS|-|-" "/dev/fk2p3|fk2|part|$RECOV_T|apfs|-|-"
+spec usb-boot "/dev/fk3||disk|-|-|-|-" "/dev/fk3p1|fk3|part|$BOOT_T|vfat|-|$C/esp-plain" \
+    "/dev/fk3p2|fk3|part|$LIN_T|ext4|-|$C/boot-asahi" "/dev/fk3p3|fk3|part|$LIN_T|crypto_LUKS|-|-"
+spec esp-m1n1 "/dev/fk4||disk|-|-|-|-" "/dev/fk4p1|fk4|part|$BOOT_T|vfat|-|$C/esp-m1n1" \
+    "/dev/fk4p2|fk4|part|$LIN_T|crypto_LUKS|-|-"
+spec esp-mounted "/dev/fk5||disk|-|-|-|-" "/dev/fk5p1|fk5|part|$BOOT_T|vfat|$C/esp-m1n1|-" \
+    "/dev/fk5p2|fk5|part|$LIN_T|crypto_LUKS|-|-"
+spec open-mapper "/dev/fk6||disk|-|-|-|-" "/dev/fk6p1|fk6|part|$LIN_T|crypto_LUKS|-|-" \
+    "/dev/mapper/fk6crypt|fk6p1|crypt|-|btrfs|$C/btrfs-top|-"
+spec plain-mounted "/dev/fk7||disk|-|-|-|-" "/dev/fk7p1|fk7|part|$BOOT_T|vfat|-|$C/esp-plain" \
+    "/dev/fk7p2|fk7|part|$LIN_T|ext4|$C/root-asahi|-"
+spec x86 "/dev/fk8||disk|-|-|-|-" "/dev/fk8p1|fk8|part|$BOOT_T|vfat|-|$C/esp-ubuntu" \
+    "/dev/fk8p2|fk8|part|$LIN_T|ext4|-|$C/boot-generic" "/dev/fk8p3|fk8|part|$LIN_T|crypto_LUKS|-|-"
+spec ext2-boot "/dev/fk9||disk|-|-|-|-" "/dev/fk9p1|fk9|part|$LIN_T|ext2|-|$C/boot-asahi" \
+    "/dev/fk9p2|fk9|part|$LIN_T|crypto_LUKS|-|-"
+spec whole-disk "/dev/fk10||disk|-|crypto_LUKS|-|-"
+spec self-only "/dev/fk11||disk|-|-|-|-" "/dev/fk11p1|fk11|part|$LIN_T|ext4|-|$C/boot-asahi"
+spec xfs-boot "/dev/fk12||disk|-|-|-|-" "/dev/fk12p1|fk12|part|$LIN_T|xfs|-|$C/boot-asahi" \
+    "/dev/fk12p2|fk12|part|$LIN_T|crypto_LUKS|-|-"
+spec mount-fails "/dev/fk13||disk|-|-|-|-" "/dev/fk13p1|fk13|part|$BOOT_T|vfat|-|-" \
+    "/dev/fk13p2|fk13|part|$LIN_T|crypto_LUKS|-|-"
+cat > "$MK/mocks.sh" <<'MOCKS'
+# Answers lsblk / findmnt / mount / umount from $MOCK_SPEC; logs to $MOCK_LOG.
+mock_tree() {   # $1 = device path -> its row, then every descendant's
+    awk -F'|' -v d="$1" '
+        { row[NR] = $0; p[NR] = $1; n = $1; sub(/^.*\//, "", n); nm[NR] = n; par[NR] = $2 }
+        END {
+            for (i = 1; i <= NR; i++) if (p[i] == d) { want[nm[i]] = 1; print row[i] }
+            for (k = 0; k < 3; k++)
+                for (i = 1; i <= NR; i++)
+                    if ((par[i] in want) && !(nm[i] in done)) { done[nm[i]] = 1; want[nm[i]] = 1; print row[i] }
+        }' "$MOCK_SPEC"
+}
+mock_field() {   # $1 = device path, $2 = field number -> that field of its row
+    awk -F'|' -v d="$1" -v f="$2" '$1 == d { print $f; exit }' "$MOCK_SPEC"
+}
+lsblk() {
+    local d="${*: -1}"
+    case "$*" in
+        "-dnpo NAME $d")           mock_field "$d" 1 ;;
+        "-dno PKNAME $d")          mock_field "$d" 2 ;;
+        "-rpno NAME,PARTTYPE $d")  mock_tree "$d" | awk -F'|' '{ print $1 " " ($4 == "-" ? "" : $4) }' ;;
+        "-rpno NAME $d")           mock_tree "$d" | cut -d'|' -f1 ;;
+        "-rpno NAME,TYPE,FSTYPE $d") mock_tree "$d" | awk -F'|' '{ print $1 " " $3 " " ($5 == "-" ? "" : $5) }' ;;
+        *) echo "mock lsblk: unexpected arguments: $*" >&2; return 99 ;;
+    esac
+}
+findmnt() {
+    case "$*" in
+        "-lno TARGET -S "*) local m; m=$(mock_field "${*: -1}" 6); [ -n "$m" ] && [ "$m" != "-" ] && printf '%s\n' "$m" ;;
+        *) echo "mock findmnt: unexpected arguments: $*" >&2; return 99 ;;
+    esac
+}
+mount() {   # mount -t FS -o OPTS SRC DIR
+    [ "$#" -eq 6 ] && [ "$1" = -t ] && [ "$3" = -o ] || { echo "mock mount: unexpected arguments: $*" >&2; return 99; }
+    local content; content=$(mock_field "$5" 7)
+    if [ -z "$content" ] || [ "$content" = "-" ]; then echo "mount-failed $5" >> "$MOCK_LOG"; return 32; fi
+    cp -R "$content/." "$6/" && echo "mount $5 $2 $4" >> "$MOCK_LOG"
+}
+umount() {
+    find "$1" -mindepth 1 -delete && echo "umount" >> "$MOCK_LOG"
+}
+MOCKS
+dev_defs() {   # $1 = shell code to load -> ll_detect_asahi_dev as bash prints it
+    env -u BASH_ENV bash -c 'set -euo pipefail; eval "$1"; declare -f ll_detect_asahi_dev' _ "$1" 2>&1
+}
+dev_verdicts() {   # $1 = shell code to load, rest = "case:device" -> "case|rc|reason|probe log"
+    env -u BASH_ENV MK="$MK" bash -c 'set -euo pipefail; eval "$1"; shift
+        . "$MK/mocks.sh"
+        MOCK_LOG="$MK/mock.log"
+        for c in "$@"; do
+            MOCK_SPEC="$MK/${c%%:*}.spec"; : > "$MOCK_LOG"
+            if ll_detect_asahi_dev "${c#*:}"; then rc=0; else rc=1; fi
+            printf "%s|%s|%s|%s\n" "${c%%:*}" "$rc" "$LL_ASAHI_REASON" "$(paste -sd";" "$MOCK_LOG")"
+        done' _ "$@" 2>&1
+}
+dev_block() {   # $1 = script under bin/ -> its asahi_dev_guard block
+    sed -n '/^# --- asahi_dev_guard ---$/,/^# --- end asahi_dev_guard ---$/p' "$REPO/bin/$1"
+}
+DEV_CASES=(apple:/dev/fk1p6 recovery:/dev/fk2p2 usb-boot:/dev/fk3p3 esp-m1n1:/dev/fk4p2
+           esp-mounted:/dev/fk5p2 open-mapper:/dev/fk6p1 plain-mounted:/dev/fk7p2 x86:/dev/fk8p3
+           ext2-boot:/dev/fk9p2 whole-disk:/dev/fk10 self-only:/dev/fk11p1 xfs-boot:/dev/fk12p2
+           mount-fails:/dev/fk13p2)
+PROBES_BEFORE=$(find /tmp -maxdepth 1 -name 'luks-asahi-probe.*' 2>/dev/null | wc -l)
+CANON_DEV=$(dev_verdicts "$CANON" "${DEV_CASES[@]}")
+# What lib-deps.sh must say, case by case: "case|rc|reason glob|probe log glob".
+DEV_WANT=(
+  "apple|0|its disk carries an Apple Silicon boot partition (/dev/fk1p1, iBootSystemContainer)|"
+  "recovery|0|its disk carries an Apple Silicon recovery partition (/dev/fk2p3, RecoveryOSContainer)|"
+  "usb-boot|0|its disk holds an Asahi kernel on /dev/fk3p2 (vmlinuz-7.1.13-402.asahi.fc44.aarch64+16k)|mount /dev/fk3p1 vfat ro;umount;mount /dev/fk3p2 ext4 ro,noload;umount"
+  "esp-m1n1|0|its disk holds m1n1 on the FAT partition /dev/fk4p1|mount /dev/fk4p1 vfat ro;umount"
+  "esp-mounted|0|its disk holds m1n1 on the FAT partition /dev/fk5p1|"
+  "open-mapper|0|it is mounted at $C/btrfs-top, and os-release identifies Fedora Asahi Remix|"
+  "plain-mounted|0|it is mounted at $C/root-asahi, and os-release identifies Fedora Asahi Remix|"
+  "x86|1||mount /dev/fk8p1 vfat ro;umount;mount /dev/fk8p2 ext4 ro,noload;umount"
+  "ext2-boot|0|its disk holds an Asahi kernel on /dev/fk9p1 (vmlinuz-7.1.13-402.asahi.fc44.aarch64+16k)|mount /dev/fk9p1 ext2 ro;umount"
+  "whole-disk|1||"
+  "self-only|1||"
+  "xfs-boot|1||"
+  "mount-fails|1||mount-failed /dev/fk13p1"
+)
+DEV_WHAT=(
+  "the real Apple Silicon layout: refused from the partition table alone, nothing mounted"
+  "an Apple Silicon recovery container alone is enough"
+  "an Asahi disk with no Apple partitions: the plain ext4 /boot beside it names an Asahi kernel (ESP ro, /boot ro,noload)"
+  "m1n1 on the FAT partition beside it (probe-mounted ro)"
+  "m1n1 on an ESP that is already mounted: read there, no probe mount"
+  "a LUKS volume whose mapper is open and mounted: the btrfs 'root' subvolume is read where it is"
+  "a plain partition already mounted (an automounting desktop): read where it is"
+  "an x86 disk (Ubuntu ESP, generic kernel): not flagged, both probes mounted read-only and unmounted"
+  "an ext2 /boot is probe-mounted ro (ext2 has no journal to skip)"
+  "a whole-disk volume with no partition table: nothing beside it to read"
+  "the selected partition itself is never probe-mounted"
+  "an xfs /boot is not probed (only FAT and ext2/3/4 are) — the documented limit"
+  "a sibling that will not mount is skipped, and its probe directory removed"
+)
+for i in "${!DEV_WANT[@]}"; do
+    want="${DEV_WANT[$i]}"
+    line=$(printf '%s\n' "$CANON_DEV" | awk -F'|' -v n="${want%%|*}" '$1 == n { print; exit }')
+    if [ "$line" = "$want" ]; then pass "${DEV_WHAT[$i]}"
+    else fail "${DEV_WHAT[$i]}: expected '$want', got '${line:-no answer}'"; fi
+done
+CASE_RE=$(printf '%s\n' "${DEV_CASES[@]}" | cut -d: -f1 | paste -sd'|')
+STRAY=$(printf '%s\n' "$CANON_DEV" | grep -vE "^($CASE_RE)\|" | head -n 3)
+[ -z "$STRAY" ] || fail "lib-deps.sh printed something besides its answers: $STRAY"
+for s in luks-deploy.sh luks-tune.sh; do
+    BLOCK="$(guard_block "$s")
+$(dev_block "$s")"
+    if [ -z "$(dev_block "$s")" ]; then fail "$s: no '# --- asahi_dev_guard ---' block"; continue; fi
+    GOT=$(dev_defs "$BLOCK")
+    if [ "$GOT" = "$(dev_defs "$CANON")" ]; then
+        pass "$s: ll_detect_asahi_dev is identical to lib-deps.sh's"
+    else
+        fail "$s: its ll_detect_asahi_dev differs from lib-deps.sh's:"
+        diff <(dev_defs "$CANON") <(printf '%s\n' "$GOT") | head -20 | sed 's/^/        /'
+    fi
+    GOT=$(dev_verdicts "$BLOCK" "${DEV_CASES[@]}")
+    if [ "$GOT" = "$CANON_DEV" ]; then
+        pass "$s: same verdict, reason and probe mounts as lib-deps.sh on ${#DEV_CASES[@]} fake disks"
+    else
+        fail "$s: its partition check differs from lib-deps.sh's:"
+        diff <(printf '%s\n' "$CANON_DEV") <(printf '%s\n' "$GOT") | head -20 | sed 's/^/        /'
+    fi
+done
+PROBES_AFTER=$(find /tmp -maxdepth 1 -name 'luks-asahi-probe.*' 2>/dev/null | wc -l)
+eq "probe directories left behind in /tmp" "$PROBES_BEFORE" "$PROBES_AFTER"
+
+# ─── 9f. Every action on the selected partition comes after its check ────────
+# luks-deploy.sh runs top to bottom, so "checked before any action" is a fact
+# about line order: the check on the partition you select must come before
+# the kept-mapper cross-check, the unmount, the LUKS mode decision, the LUKS1
+# conversion, the hand-off to luks-tune.sh and the resumed encryption; the
+# mapper an earlier run left open is checked before it is unmounted; the
+# inside of a LUKS1 volume before its header is converted; and luks-tune.sh
+# checks the volume picked before it backs up or re-costs anything.
+echo ""
+echo "[9f] The Asahi checks come before the actions they guard"
+first_line() {   # $1 = file, $2 = fixed string -> line of its first occurrence, or 0
+    local n; n=$(grep -nF -- "$2" "$1" | head -n 1 | cut -d: -f1)
+    printf '%s' "${n:-0}"
+}
+before() {   # $1 = label, $2 = file, $3 = the check, $4 = the action
+    local c a; c=$(first_line "$2" "$3"); a=$(first_line "$2" "$4")
+    if [ "$c" -gt 0 ] && [ "$a" -gt 0 ] && [ "$c" -lt "$a" ]; then pass "$1 (line $c, then $a)"
+    else fail "$1: check at line $c ('$3') must come before line $a ('$4')"; fi
+}
+D="$REPO/bin/luks-deploy.sh"; T="$REPO/bin/luks-tune.sh"
+SEL='ll_detect_asahi_dev "$TARGET_ROOT"'
+before "luks-deploy.sh: the partition you select is checked before a kept mapper is cross-checked and closed" "$D" "$SEL" 'MAPPER_BACKING=$(cryptsetup status'
+before "... before it is unmounted" "$D" "$SEL" 'ensure_unmounted "$TARGET_ROOT"'
+before "... before its LUKS header decides the mode" "$D" "$SEL" "if blkid \"\$TARGET_ROOT\" | grep -q 'TYPE=\"crypto_LUKS\"'"
+before "... before a LUKS1 conversion" "$D" "$SEL" 'convert_luks1 "$TARGET_ROOT"'
+before "... before the hand-off to luks-tune.sh" "$D" "$SEL" 'exec "$SCRIPT_DIR/luks-tune.sh"'
+before "... before an interrupted encryption is resumed" "$D" "$SEL" 'cryptsetup reencrypt --resume-only --verbose'
+before "... before the discovery mount" "$D" "$SEL" 'mount -o subvolid=5,ro "$DISCOVERY_DEV"'
+before "luks-deploy.sh: a mapper an earlier run left open is checked before it is unmounted" "$D" 'll_detect_asahi_dev "$STALE_BACKING"' 'umount -R /mnt 2>/dev/null'
+before "luks-deploy.sh: the inside of a LUKS1 volume is checked before its header is converted" "$D" 'if ll_detect_asahi "/mnt_temp/${psub%/}"' 'cryptsetup convert --type luks2 --batch-mode'
+before "luks-tune.sh: the volume picked is checked before its header is backed up" "$T" 'll_detect_asahi_dev "$DEV"' '"$CRYPTSETUP" luksHeaderBackup'
+before "luks-tune.sh: ... before a keyslot is re-costed" "$T" 'll_detect_asahi_dev "$DEV"' '"$CRYPTSETUP" luksConvertKey -S'
+
+# ─── 9g. The partition check on this machine's own disks ─────────────────────
+# Where a disk here carries an Apple Silicon system partition, the canonical
+# check must flag another partition on it from the partition table alone.
+# Real lsblk and findmnt; mount is replaced by a function that refuses and
+# records, so this can never probe-mount anything, even if the check broke.
+echo ""
+echo "[9g] The partition check against this machine's disks"
+APPLE_PART=$(lsblk -rpno NAME,PARTTYPE 2>/dev/null \
+    | awk -v a="$IBOOT_T" -v r="$RECOV_T" 'tolower($2) == a || tolower($2) == r { print $1; exit }')
+if [ -z "$APPLE_PART" ]; then
+    skip "no disk here carries an Apple Silicon system partition"
+else
+    APPLE_DISK=$(lsblk -dno PKNAME "$APPLE_PART" 2>/dev/null | head -n 1)
+    VICTIM=$(lsblk -rpno NAME,TYPE,FSTYPE "/dev/$APPLE_DISK" 2>/dev/null | awk '$2 == "part" && $3 == "crypto_LUKS" { print $1; exit }')
+    [ -n "$VICTIM" ] || VICTIM=$(lsblk -rpno NAME,TYPE "/dev/$APPLE_DISK" 2>/dev/null | awk -v a="$APPLE_PART" '$2 == "part" && $1 != a { print $1; exit }')
+    GOT=$(env -u BASH_ENV bash -c '. "$1"; mount() { echo "MOUNT-ATTEMPT $*"; return 1; }
+        if ll_detect_asahi_dev "$2"; then echo "rc=0 $LL_ASAHI_REASON"; else echo "rc=1"; fi' _ "$REPO/bin/lib-deps.sh" "$VICTIM" 2>&1)
+    case "$GOT" in
+        *MOUNT-ATTEMPT*) fail "$VICTIM: the check tried to mount something: $GOT" ;;
+        "rc=0 its disk carries an Apple Silicon "*) pass "$VICTIM on this machine: ${GOT#rc=0 }" ;;
+        *) fail "$VICTIM sits beside $APPLE_PART but was not flagged: $GOT" ;;
+    esac
 fi
 
 # ─── 10. This machine, if it is itself a UKI target ──────────────────────────
