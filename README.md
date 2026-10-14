@@ -1129,7 +1129,7 @@ the passing suites for a boot.
 
 MIT — see [LICENSE](LICENSE).
 
-- **Version:** 1.6.3
+- **Version:** 1.6.4
 - **Author:** William MacKinnon ([doug445](https://github.com/doug445))
 - **Email:** spilled-bowline0j@icloud.com
 - **Repository:** https://github.com/doug445/LinuxLocker
