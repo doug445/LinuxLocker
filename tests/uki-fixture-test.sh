@@ -29,6 +29,12 @@
 #   6.  a real PE binary round-trips through uki_cmdline_of
 #   7.  detection against THIS machine matches what it really runs, when this
 #       machine is itself a UKI target (skipped everywhere else)
+#   8.  the Fedora Asahi Remix guard: every signal it reads; the copies that
+#       luks-deploy.sh, luks-tune.sh and post-encryption-setup.sh carry are
+#       identical to lib-deps.sh's and give the same verdicts; no check is
+#       gated on a library being present; and each script, run unprivileged
+#       with no lib-deps.sh beside it, refuses on an Asahi / Apple Silicon
+#       machine and gets past the check cleanly everywhere else
 #
 # Run:  bash tests/uki-fixture-test.sh        (no root, no disk, no network)
 # ============================================================================
@@ -336,6 +342,198 @@ M="$TMP/m1n1"; mkdir -p "$M/etc" "$M/boot/efi/m1n1"
 printf 'NAME="Some Distro"\nID=other\n' > "$M/etc/os-release"
 if ll_detect_asahi "$M"; then pass "m1n1 boot components detected without os-release help"
 else fail "m1n1 present but not detected"; fi
+
+# One fixture per remaining signal, each behind an os-release that says
+# nothing, so the signal under test is the only thing that can fire.
+asahi_fx() {   # $1 = name -> path of a fresh root holding a neutral os-release
+    local r="$TMP/asahi-fx/$1"
+    mkdir -p "$r/etc"
+    printf 'NAME="Some Distro"\nID=other\n' > "$r/etc/os-release"
+    printf '%s' "$r"
+}
+FX_ROOTS=(); FX_WANT=(); FX_WHAT=()
+fx() { FX_ROOTS+=("$1"); FX_WANT+=("$2"); FX_WHAT+=("$3"); }   # root, 0=Asahi|1=not, label
+R=$(asahi_fx f44)   # what a real Fedora Asahi Remix 44 install ships: VARIANT_ID is the edition
+printf '%s\n' 'NAME="Fedora Linux Asahi Remix"' 'ID=fedora-asahi-remix' \
+    'PRETTY_NAME="Fedora Linux Asahi Remix 44 (KDE Plasma Desktop Edition)"' \
+    'VARIANT="KDE Plasma Desktop Edition"' 'VARIANT_ID=kde' > "$R/etc/os-release"
+fx "$R" 0 "Fedora Asahi Remix 44 os-release (ID=fedora-asahi-remix, VARIANT_ID=kde)"
+R=$(asahi_fx usrlib); rm -f "$R/etc/os-release"; mkdir -p "$R/usr/lib"
+printf 'NAME="Fedora Linux Asahi Remix"\nID=fedora-asahi-remix\n' > "$R/usr/lib/os-release"
+fx "$R" 0 "os-release only at /usr/lib/os-release"
+R=$(asahi_fx kmod-usr); mkdir -p "$R/usr/lib/modules/7.1.13-402.asahi.fc44.aarch64+16k"
+fx "$R" 0 "an Asahi kernel in /usr/lib/modules"
+R=$(asahi_fx kmod-lib); mkdir -p "$R/lib/modules/7.1.13-402.asahi.fc44.aarch64+16k"
+fx "$R" 0 "an Asahi kernel in /lib/modules"
+R=$(asahi_fx default-m1n1); mkdir -p "$R/etc/default"; : > "$R/etc/default/m1n1"
+fx "$R" 0 "/etc/default/m1n1"
+R=$(asahi_fx asahi-boot); mkdir -p "$R/usr/lib/asahi-boot"
+fx "$R" 0 "/usr/lib/asahi-boot"
+R=$(asahi_fx debian); printf 'NAME="Debian GNU/Linux"\nID=debian\n' > "$R/etc/os-release"
+mkdir -p "$R/usr/lib/modules/6.12.0-1-arm64"
+fx "$R" 1 "Debian on arm64 with a stock kernel"
+R="$TMP/asahi-fx/empty"; mkdir -p "$R"
+fx "$R" 1 "an empty root (no os-release, no kernel)"
+for i in "${!FX_ROOTS[@]}"; do
+    if ll_detect_asahi "${FX_ROOTS[$i]}"; then got=0; else got=1; fi
+    if [ "$got" = "${FX_WANT[$i]}" ]; then
+        if [ "$got" = 0 ]; then pass "${FX_WHAT[$i]}: detected ($LL_ASAHI_REASON)"
+        else pass "${FX_WHAT[$i]}: not flagged"; fi
+    else
+        if [ "$got" = 0 ]; then fail "${FX_WHAT[$i]}: wrongly flagged ($LL_ASAHI_REASON)"
+        else fail "${FX_WHAT[$i]}: NOT detected"; fi
+    fi
+done
+ALL_FX=("$A" "$F" "$M" "${FX_ROOTS[@]}")
+
+# ─── 9b. The copies of the guard agree with lib-deps.sh ──────────────────────
+# luks-deploy.sh, luks-tune.sh and post-encryption-setup.sh each carry the
+# guard between '# --- asahi_guard ---' markers, so the refusal still fires
+# when lib-deps.sh was not copied along (until 1.6.4 luks-deploy.sh skipped it
+# silently then). Each block is loaded into a fresh bash holding nothing else
+# and compared with lib-deps.sh: the functions as bash itself prints them
+# (comments and layout ignored), then the verdict and the reason on every
+# fixture above and on this machine.
+echo ""
+echo "[9b] The scripts' own copies of the Asahi guard match lib-deps.sh"
+guard_defs() {   # $1 = shell code to load -> the guard's functions and URL, as bash prints them
+    env -u BASH_ENV bash -c 'set -euo pipefail; eval "$1"
+        declare -f ll_detect_asahi ll_link ll_asahi_refuse
+        printf "URL=%s\n" "$LL_ASAHILOCKER_URL"' _ "$1" 2>&1
+}
+guard_verdicts() {   # $1 = shell code to load, rest = roots -> "root|rc|reason" for each
+    env -u BASH_ENV bash -c 'set -euo pipefail; eval "$1"; shift
+        for r in "$@"; do
+            if ll_detect_asahi "$r"; then rc=0; else rc=1; fi
+            printf "%s|%s|%s\n" "$r" "$rc" "$LL_ASAHI_REASON"
+        done' _ "$@" 2>&1
+}
+guard_block() {   # $1 = script under bin/ -> its asahi_guard block
+    sed -n '/^# --- asahi_guard ---$/,/^# --- end asahi_guard ---$/p' "$REPO/bin/$1"
+}
+CANON=". \"$REPO/bin/lib-deps.sh\""
+CANON_DEFS=$(guard_defs "$CANON")
+CANON_VERDICTS=$(guard_verdicts "$CANON" "${ALL_FX[@]}" "")
+for s in luks-deploy.sh luks-tune.sh post-encryption-setup.sh; do
+    BLOCK=$(guard_block "$s")
+    if [ -z "$BLOCK" ]; then fail "$s: no '# --- asahi_guard ---' block"; continue; fi
+    GOT=$(guard_defs "$BLOCK")
+    if [ "$GOT" = "$CANON_DEFS" ]; then
+        pass "$s: ll_detect_asahi, ll_link, ll_asahi_refuse and the URL are identical to lib-deps.sh's"
+    else
+        fail "$s: its copy of the guard differs from lib-deps.sh's:"
+        diff <(printf '%s\n' "$CANON_DEFS") <(printf '%s\n' "$GOT") | head -20 | sed 's/^/        /'
+    fi
+    GOT=$(guard_verdicts "$BLOCK" "${ALL_FX[@]}" "")
+    if [ "$GOT" = "$CANON_VERDICTS" ]; then
+        pass "$s: same verdict and reason as lib-deps.sh on ${#ALL_FX[@]} fixtures and on this machine"
+    else
+        fail "$s: its verdicts differ from lib-deps.sh's:"
+        diff <(printf '%s\n' "$CANON_VERDICTS") <(printf '%s\n' "$GOT") | head -20 | sed 's/^/        /'
+    fi
+done
+# A lib-deps.sh from before 1.2.0 has no guard in it at all. Sourcing one must
+# not leave a script without the check: the block sees the missing functions
+# and defines its own.
+STALE_LIB="$TMP/lib-deps-pre-1.2.0.sh"
+sed '/^# Apple Silicon \/ Fedora Asahi Remix guard$/,$d' "$REPO/bin/lib-deps.sh" > "$STALE_LIB"
+if grep -q 'll_detect_asahi()' "$STALE_LIB" || ! grep -q 'll_ensure_tools()' "$STALE_LIB"; then
+    fail "could not build a guard-less lib-deps.sh fixture"
+else
+    GOT=$(guard_verdicts ". \"$STALE_LIB\"
+$(guard_block luks-deploy.sh)" "${ALL_FX[@]}" "")
+    if [ "$GOT" = "$CANON_VERDICTS" ]; then
+        pass "a guard-less (pre-1.2.0) lib-deps.sh does not disable the check: the block stands in"
+    else
+        fail "with a guard-less lib-deps.sh loaded, the block did not stand in:"
+        diff <(printf '%s\n' "$CANON_VERDICTS") <(printf '%s\n' "$GOT") | head -20 | sed 's/^/        /'
+    fi
+fi
+
+# ─── 9c. No Asahi check hangs on a library being present ─────────────────────
+# The defect fixed in 1.6.4: both checks in luks-deploy.sh were written
+# `[ "$LL_HAVE_DEPS_LIB" -eq 1 ] && ll_detect_asahi ...`, so a copy without
+# lib-deps.sh skipped the refusal without a word.
+echo ""
+echo "[9c] Every Asahi check is unconditional"
+for s in linuxlocker.sh luks-deploy.sh luks-tune.sh post-encryption-setup.sh; do
+    CALLS=$(grep -nE '^[^#]*ll_detect_asahi "' "$REPO/bin/$s")
+    if [ -z "$CALLS" ]; then fail "$s: never calls ll_detect_asahi"; continue; fi
+    if printf '%s\n' "$CALLS" | grep -q 'HAVE_'; then
+        fail "$s: an Asahi check is gated on a library flag: $(printf '%s\n' "$CALLS" | grep -m1 'HAVE_')"
+    else
+        pass "$s: $(printf '%s\n' "$CALLS" | wc -l | tr -d ' ') Asahi check(s), none gated on a library being present"
+    fi
+done
+
+# ─── 9d. Standalone runs: no lib-deps.sh next to the script ──────────────────
+# The end-to-end form of 9b: each script copied into a directory WITHOUT
+# lib-deps.sh (or with the guard-less one) and run for real. On an Asahi or
+# Apple Silicon machine every run must refuse — exit 3, the reason, the
+# AsahiLocker link — before anything else; everywhere else every run must get
+# past the check cleanly and stop at its next gate. Unprivileged only, with an
+# empty environment and stdin from /dev/null, so no LUKS_* pin can leak in and
+# a regressed guard still stops at the root check: these runs never reach a
+# device.
+echo ""
+echo "[9d] Standalone runs without lib-deps.sh (unprivileged)"
+if [ "$(id -u)" -eq 0 ]; then
+    skip "running as root — the standalone runs are made unprivileged only, so a regressed guard can never reach a device"
+else
+    if ll_detect_asahi ""; then
+        HOST_ASAHI=1; HOST_REASON="$LL_ASAHI_REASON"
+        echo "       this machine is Asahi / Apple Silicon ($HOST_REASON): every run must refuse"
+    else
+        HOST_ASAHI=0; HOST_REASON=""
+        echo "       this machine is not Asahi: every run must pass the check and stop at its next gate"
+    fi
+    TO=(); command -v timeout >/dev/null 2>&1 && TO=(timeout 120)
+    OUT=""; RC=0
+    run_alone() {   # $1 = directory, $2 = script, rest = arguments -> OUT, RC
+        local dir="$1" s="$2"; shift 2
+        OUT=$(cd "$dir" && "${TO[@]}" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$dir" \
+                  bash "./$s" "$@" </dev/null 2>&1)
+        RC=$?
+    }
+    check_alone() {   # $1 = label, $2 = exit expected off Asahi, $3 = ERE that run must print
+        local err
+        err=$(printf '%s\n' "$OUT" | grep -m1 -E 'command not found|unbound variable|syntax error')
+        if [ -n "$err" ]; then fail "$1: the run hit a shell error: $err"; return; fi
+        if [ "$HOST_ASAHI" -eq 1 ]; then
+            if [ "$RC" -eq 3 ] && [[ "$OUT" == *"WRONG TOOL"* ]] \
+               && [[ "$OUT" == *"Reason: $HOST_REASON"* ]] && [[ "$OUT" == *"$LL_ASAHILOCKER_URL"* ]]; then
+                pass "$1: refused — exit 3, the reason and the AsahiLocker link"
+            else
+                fail "$1: expected the Asahi refusal (exit 3), got exit $RC: $(printf '%s\n' "$OUT" | tail -3 | tr '\n' ' ')"
+            fi
+        elif [ "$RC" -eq "$2" ] && [[ "$OUT" != *"WRONG TOOL"* ]] && printf '%s\n' "$OUT" | grep -qE "$3"; then
+            pass "$1: past the Asahi check, stopped at its next gate (exit $RC)"
+        else
+            fail "$1: expected exit $2 matching /$3/, got exit $RC: $(printf '%s\n' "$OUT" | tail -3 | tr '\n' ' ')"
+        fi
+    }
+    D="$TMP/alone-deploy"; mkdir -p "$D"
+    cp "$REPO/bin/luks-deploy.sh" "$REPO/bin/lib-boot.sh" "$REPO/bin/lib-uki.sh" "$D/"
+    run_alone "$D" luks-deploy.sh --dry-run
+    check_alone "luks-deploy.sh beside lib-boot.sh and lib-uki.sh, no lib-deps.sh" 1 'Must run as root'
+    D="$TMP/alone-deploy-only"; mkdir -p "$D"
+    cp "$REPO/bin/luks-deploy.sh" "$D/"
+    run_alone "$D" luks-deploy.sh --dry-run
+    check_alone "luks-deploy.sh entirely alone" 1 'lib-boot\.sh not found'
+    D="$TMP/stale-deploy"; mkdir -p "$D"
+    cp "$REPO/bin/luks-deploy.sh" "$REPO/bin/lib-boot.sh" "$REPO/bin/lib-uki.sh" "$D/"
+    cp "$STALE_LIB" "$D/lib-deps.sh"
+    run_alone "$D" luks-deploy.sh --dry-run
+    check_alone "luks-deploy.sh beside a guard-less (pre-1.2.0) lib-deps.sh" 1 'Must run as root'
+    D="$TMP/alone-tune"; mkdir -p "$D"
+    cp "$REPO/bin/luks-tune.sh" "$D/"
+    run_alone "$D" luks-tune.sh --dry-run
+    check_alone "luks-tune.sh entirely alone" 1 "Run as root|cryptsetup not found|Neither 'dialog' nor 'whiptail'"
+    D="$TMP/alone-post"; mkdir -p "$D"
+    cp "$REPO/bin/post-encryption-setup.sh" "$D/"
+    run_alone "$D" post-encryption-setup.sh
+    check_alone "post-encryption-setup.sh entirely alone" 1 'run as root'
+fi
 
 # ─── 10. This machine, if it is itself a UKI target ──────────────────────────
 # The fixtures prove the logic; this proves the logic matches reality on at
