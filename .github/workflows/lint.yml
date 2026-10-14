@@ -6,11 +6,17 @@ on:
 permissions:
   contents: read
 
+# Runners are pinned, not ubuntu-latest: that label becomes Ubuntu 26 on
+# 2026-10-19, which would change shellcheck and the test environment under
+# the x86 legs while the arm legs stayed on 24.04. A gate has to mean the same
+# thing on every run, and the two legs of a matrix must differ only by
+# architecture. actions/checkout@v5 runs on Node 24.
+
 jobs:
   shellcheck:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: bash syntax check (bash -n)
         run: |
@@ -31,30 +37,32 @@ jobs:
   loopback:
     # Real cryptsetup reencrypt + hard-kill/repair/resume against a throwaway
     # file-backed loop device — no real disk is ever touched or modified.
+    # gdisk + dosfstools: the GPT images of sections 10 and 11 (sgdisk, and
+    # the FAT ESP of the Apple Silicon layout).
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - name: install cryptsetup + btrfs-progs
+      - uses: actions/checkout@v5
+      - name: install cryptsetup + btrfs-progs + gdisk + dosfstools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q cryptsetup-bin btrfs-progs
+          sudo apt-get install -y -q cryptsetup-bin btrfs-progs gdisk dosfstools
       - name: loopback core test
         run: sudo bash tests/loopback-core-test.sh
 
   uki-fixtures:
     # UKI / systemd-boot / Secure Boot detection against synthetic target
-    # trees. No disk, no root, no network — pure logic, so it runs everywhere.
+    # trees, and the Apple Silicon guard. No disk, no root, no network.
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: install binutils (objcopy, for .cmdline extraction)
         run: sudo apt-get update -q && sudo apt-get install -y -q binutils
       - name: UKI fixture test
@@ -67,9 +75,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: command-line carrier fixture test
         run: bash tests/cmdline-fixture-test.sh

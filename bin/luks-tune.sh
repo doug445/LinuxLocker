@@ -178,6 +178,86 @@ if ll_detect_asahi ""; then
     ll_asahi_refuse "This machine is Apple Silicon / Fedora Asahi Remix."
     exit 3
 fi
+# The volume you pick gets its own check, before anything is done to it — a
+# disk carried over from an Asahi system shows nothing to the check above.
+# Identical to luks-deploy.sh's asahi_dev_guard block and to lib-deps.sh's
+# ll_detect_asahi_dev; tests/uki-fixture-test.sh keeps them so.
+# --- asahi_dev_guard ---
+if ! declare -F ll_detect_asahi_dev >/dev/null; then
+    ll_detect_asahi_dev() {
+        local dev="$1" self disk path type fs mp sub tmp opts hit k
+        LL_ASAHI_REASON=""
+        self=$(lsblk -dnpo NAME "$dev" 2>/dev/null | head -n 1)
+        [ -n "$self" ] || self="$dev"
+        disk=$(lsblk -dno PKNAME "$dev" 2>/dev/null | head -n 1)
+        if [ -n "$disk" ]; then
+            while read -r path type; do
+                case "${type,,}" in
+                    69646961-6700-11aa-aa11-00306543ecac)
+                        LL_ASAHI_REASON="its disk carries an Apple Silicon boot partition ($path, iBootSystemContainer)"
+                        return 0 ;;
+                    52637672-7900-11aa-aa11-00306543ecac)
+                        LL_ASAHI_REASON="its disk carries an Apple Silicon recovery partition ($path, RecoveryOSContainer)"
+                        return 0 ;;
+                esac
+            done < <(lsblk -rpno NAME,PARTTYPE "/dev/$disk" 2>/dev/null)
+        fi
+        while read -r path; do
+            [ -n "$path" ] || continue
+            while read -r mp; do
+                [ -n "$mp" ] || continue
+                for sub in "" root @rootfs @; do
+                    if ll_detect_asahi "${mp%/}${sub:+/$sub}"; then
+                        LL_ASAHI_REASON="it is mounted at $mp, and $LL_ASAHI_REASON"
+                        return 0
+                    fi
+                done
+            done < <(findmnt -lno TARGET -S "$path" 2>/dev/null)
+        done < <(lsblk -rpno NAME "$dev" 2>/dev/null)
+        if [ -n "$disk" ]; then
+            while read -r path type fs; do
+                [ "$type" = part ] && [ "$path" != "$self" ] || continue
+                case "$fs" in
+                    vfat)      opts=ro ;;
+                    ext3|ext4) opts=ro,noload ;;
+                    ext2)      opts=ro ;;
+                    *)         continue ;;
+                esac
+                mp=$(findmnt -lno TARGET -S "$path" 2>/dev/null | head -n 1)
+                tmp=""
+                if [ -z "$mp" ]; then
+                    tmp=$(mktemp -d /tmp/luks-asahi-probe.XXXXXX) || continue
+                    if mount -t "$fs" -o "$opts" "$path" "$tmp" 2>/dev/null; then
+                        mp="$tmp"
+                    else
+                        rmdir "$tmp" 2>/dev/null
+                        continue
+                    fi
+                fi
+                hit=""
+                if [ "$fs" = vfat ]; then
+                    [ -e "$mp/m1n1" ] && hit="m1n1 on the FAT partition $path"
+                else
+                    for k in "$mp"/vmlinuz-*asahi* "$mp"/boot/vmlinuz-*asahi*; do
+                        [ -e "$k" ] || continue
+                        hit="an Asahi kernel on $path ($(basename "$k"))"
+                        break
+                    done
+                fi
+                if [ -n "$tmp" ]; then
+                    umount "$tmp" 2>/dev/null
+                    rmdir "$tmp" 2>/dev/null
+                fi
+                if [ -n "$hit" ]; then
+                    LL_ASAHI_REASON="its disk holds $hit"
+                    return 0
+                fi
+            done < <(lsblk -rpno NAME,TYPE,FSTYPE "/dev/$disk" 2>/dev/null)
+        fi
+        return 1
+    }
+fi
+# --- end asahi_dev_guard ---
 
 # ─── Profiles (mirrors luks-deploy.sh; memory in KiB) ────────────────────────
 P_PARANOID_MEM=4194304;   P_PARANOID_ITER=12
@@ -250,6 +330,16 @@ done
 DEV=$(ui --title "Select a LUKS2 volume" \
          --menu "Keyslot parameters are per-volume." 16 74 6 \
          "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3) || { clear; exit 0; }
+
+# ─── Apple Silicon / Fedora Asahi Remix — the volume you picked ──────────────
+# Before anything is done to it: its disk's partition types, anything already
+# mounted from it, and the plain partitions beside it. Nothing here needs the
+# passphrase, so a closed volume with nothing Asahi outside it passes.
+if ll_detect_asahi_dev "$DEV"; then
+    clear
+    ll_asahi_refuse "The volume you picked belongs to an Apple Silicon / Fedora Asahi Remix system."
+    exit 3
+fi
 
 # ─── Does GRUB itself unlock this volume? ────────────────────────────────────
 # Its mapper may be the running root ("" = this system), mounted somewhere

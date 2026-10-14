@@ -25,7 +25,7 @@ gh api repos/doug445/LinuxLocker/rulesets/RULESET_ID --jq '.rules'
 |---|---|
 | `deletion` | `main` cannot be deleted |
 | `non_fast_forward` | no force-pushing `main`; history cannot be rewritten |
-| `required_status_checks` | a pull request merges into `main` only when every CI job in `lint.yml` has passed: `shellcheck`, `loopback` and `uki-fixtures` and `cmdline-fixtures` on both `ubuntu-latest` and `ubuntu-24.04-arm`. Not strict (the branch need not be up to date), and not enforced on branch creation |
+| `required_status_checks` | a pull request merges into `main` only when every CI job in `lint.yml` has passed: `shellcheck`, `loopback` and `uki-fixtures` and `cmdline-fixtures` on both `ubuntu-24.04` and `ubuntu-24.04-arm` (pinned runners, see `lint.yml`). Not strict (the branch need not be up to date), and not enforced on branch creation |
 
 The status-check rule exists for contributors: a filesystem handler or a
 boot-stack patch that does not pass what CI runs must not merge. The contexts

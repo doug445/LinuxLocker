@@ -146,10 +146,15 @@ interesting surface:
   before encryption, while aborting is still free. Either of them not firing on
   a target that meets its condition is in scope, as is `sbctl` being claimed as
   a signer when it has no key directory (it exits 0 having signed nothing).
-* **The Apple Silicon guard not guarding.** Fedora Asahi Remix and Apple Silicon
-  hardware are detected and refused before any device is touched, because this
-  tool drops the boot guards AsahiLocker carries. That refusal failing to fire
-  on an Asahi system is a serious bug, not a missing feature.
+* **The Apple Silicon guard not guarding.** `linuxlocker.sh`, `luks-deploy.sh`,
+  `luks-tune.sh` and `post-encryption-setup.sh` refuse a machine running Fedora
+  Asahi Remix, or any Apple Silicon hardware, before any device is touched, and
+  `luks-deploy.sh` and `luks-tune.sh` refuse an Asahi disk attached to another
+  machine before anything is done to it, because this tool drops the boot
+  guards AsahiLocker carries. The one thing the disk check cannot see is
+  documented in [docs/BOOTLOADERS.md](docs/BOOTLOADERS.md#apple-silicon). A
+  refusal failing to fire anywhere else is a serious bug, not a missing
+  feature.
 * **The diagnostic bundle leaking key material.** `linuxlocker-diag.sh` is
   read-only and is meant to be pasted into a public issue. Anything resembling
   key material appearing in its output — a master key, header-backup contents,

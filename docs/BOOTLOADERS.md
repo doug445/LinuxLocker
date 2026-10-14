@@ -385,8 +385,53 @@ sbctl sign -s /boot/EFI/Linux/*.efi             # then re-sign, if Secure Boot i
 
 ## Apple Silicon
 
-Fedora Asahi Remix is **refused outright**, at the front door and again when the
-selected partition turns out to hold one. Its boot chain is
+Fedora Asahi Remix is **refused outright**. Its boot chain is
 iBoot → m1n1 → U-Boot → GRUB, and its stub partitions are read by the Apple
 firmware itself. Use [AsahiLocker](https://github.com/doug445/AsahiLocker),
 which carries the guards this tool deliberately drops.
+
+**The machine.** `linuxlocker.sh` (every action but the read-only `diag`
+report), `luks-deploy.sh`, `luks-tune.sh` and `post-encryption-setup.sh` first
+check the machine they run on — os-release, an Asahi kernel, m1n1 boot
+components, an Apple Silicon device tree — and exit with a link to AsahiLocker
+before any device is touched. `bin/lib-deps.sh` holds the canonical check; each
+script carries an identical copy (between `# --- asahi_guard ---` markers) that
+stands in when `lib-deps.sh` is missing or too old to have one, and
+`tests/uki-fixture-test.sh` fails if a copy drifts.
+
+**The partition.** An Asahi disk can be attached to another machine, so the
+partition you select in `luks-deploy.sh`, and the volume you pick in
+`luks-tune.sh`, are checked before anything is done to them, from what needs no
+passphrase (`ll_detect_asahi_dev`):
+
+- an Apple Silicon boot (iBootSystemContainer) or recovery (RecoveryOSContainer)
+  partition anywhere on the same disk, as an Apple Silicon Mac's internal disk
+  carries;
+- a filesystem already mounted from it, or from a mapper open on it;
+- the plain partitions beside it: m1n1 at the top of a FAT partition (the Asahi
+  ESP), or a kernel whose release names asahi on an ext2/3/4 one (Fedora Asahi
+  Remix keeps `/boot` plain ext4). They are read where they are mounted, or
+  mounted read-only for a look — `noload` on ext3/4, so no journal is replayed
+  — and unmounted again. The selected partition itself is never mounted for it.
+
+In `luks-deploy.sh` that check comes before the unmount, the LUKS1 conversion,
+the resume of an interrupted encryption, the hand-off to `luks-tune.sh`, the
+shrink, the encryption and the configuration, and a mapper an earlier run left
+open is checked the same way before it is unmounted or closed. The system on
+the partition is checked as well, the first time the run can read it, before
+anything is written to it: straight after the read-only discovery mount when
+the partition is not encrypted, and after unlocking when it is — in the
+read-only look before a LUKS1 conversion, and at the start of the
+configuration phase.
+
+**What it cannot see.** An Asahi system sealed inside a LUKS volume with
+nothing Asahi outside it: no Apple Silicon partition on its disk, and no m1n1
+and no Asahi kernel on a FAT or ext2/3/4 partition beside it — a `/boot` inside
+the volume, on another disk, or on another filesystem. Such a volume is checked
+only from the inside, once something unlocks it. The configuration phase always
+does, and refuses before it writes. The look before a LUKS1 conversion does
+unless the GRUB images on the disk already show that GRUB unlocks the volume,
+or its filesystem will not mount. Finishing an interrupted encryption
+(`--resume-only`) and re-costing keyslots in `luks-tune.sh` act on the volume
+without opening it, so on a disk like that they are not refused: use
+AsahiLocker for them.

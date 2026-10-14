@@ -137,9 +137,12 @@ LinuxLocker drops those and generalises everything else: the package-manager
 layer, the filesystem handlers, and the boot-configuration rewriter.
 
 **On Apple Silicon, use AsahiLocker. Everywhere else, use LinuxLocker.** You do
-not have to keep that straight yourself — LinuxLocker detects Fedora Asahi Remix
-and Apple Silicon hardware and exits with a link to AsahiLocker before touching
-any device.
+not have to keep that straight yourself — on a machine running Fedora Asahi
+Remix, or on any Apple Silicon hardware, `linuxlocker.sh`, `luks-deploy.sh`,
+`luks-tune.sh` and `post-encryption-setup.sh` exit with a link to AsahiLocker
+before touching any device, and `luks-deploy.sh` and `luks-tune.sh` refuse an
+Asahi disk attached to another machine before doing anything to it, with the
+one blind spot described in [BOOTLOADERS.md](BOOTLOADERS.md#apple-silicon).
 
 ## Safety posture
 

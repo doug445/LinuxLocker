@@ -411,6 +411,135 @@ else
     echo "  SKIP: cannot create a partitioned loop device here"
 fi
 
+echo "== 11. an Apple Silicon disk: the partition you select is refused before anything is done to it =="
+# luks-deploy.sh checks the partition you select before it unmounts, converts,
+# resumes, tunes, shrinks or encrypts anything, from what needs no passphrase:
+# the partition types on its disk and the plain partitions beside it. A GPT
+# image laid out like an Apple Silicon Mac's disk — an "Apple Silicon boot"
+# (iBootSystemContainer) partition, an ESP holding m1n1/, an ext4 /boot
+# holding an Asahi kernel, a LUKS root — is put to ll_detect_asahi_dev one
+# signal at a time, with the ESP and /boot hashed before and after to prove
+# the read-only probe mounts write nothing. Then the real luks-deploy.sh is
+# pointed at the LUKS root with --dry-run, in a private mount namespace, in
+# each state a LUKS partition can be in — LUKS1 (the conversion path), LUKS2
+# mid-encryption (the resume path), finished LUKS2 (the tune/config menu) —
+# and must refuse with its header untouched.
+BIN="$(cd "$(dirname "$0")/../bin" && pwd)"
+IMG11="$WORK/apple.img"; truncate -s 512M "$IMG11"
+IBOOT=69646961-6700-11AA-AA11-00306543ECAC
+L11=""
+attach11() {   # (re)attach the image with its partitions; sets L11
+    L11=$(losetup --show -f --partscan "$IMG11") || return 1
+    LOOPS_EXTRA="${LOOPS_EXTRA:-} $L11"
+    refresh11
+    [ -b "${L11}p4" ]
+}
+refresh11() {   # let udev re-read what mkfs and sgdisk changed (lsblk reads udev)
+    udevadm trigger --action=change "$L11" "$L11"p? 2>/dev/null || true
+    udevadm settle 2>/dev/null || sleep 1
+}
+retype11() {   # $1 = GPT type for partition 1; re-attaches the image
+    losetup -d "$L11" 2>/dev/null || true
+    sgdisk -t "1:$1" "$IMG11" >/dev/null && attach11
+}
+dev_check() {   # $1 = device -> "rc|reason" from lib-deps.sh's ll_detect_asahi_dev
+    bash -c '. "$1"; if ll_detect_asahi_dev "$2"; then echo "0|$LL_ASAHI_REASON"; else echo "1|"; fi' _ "$BIN/lib-deps.sh" "$1"
+}
+side_hash() {   # the ESP and /boot, byte for byte
+    sha256sum "${L11}p2" "${L11}p3" | awk '{ print $1 }' | paste -sd' '
+}
+probes() { find /tmp -maxdepth 1 -name 'luks-asahi-probe.*' 2>/dev/null | wc -l; }
+expect_dev() {   # $1 = label, $2 = expected "rc|reason"
+    local h0 h1 p0 got
+    h0=$(side_hash); p0=$(probes)
+    got=$(dev_check "${L11}p4")
+    h1=$(side_hash)
+    if [ "$got" != "$2" ]; then fail "$1: expected '$2', got '$got'"
+    elif [ "$h0" != "$h1" ]; then fail "$1: the ESP or /boot CHANGED during the check"
+    elif [ -n "$(findmnt -rno TARGET -S "${L11}p2" 2>/dev/null)$(findmnt -rno TARGET -S "${L11}p3" 2>/dev/null)" ]; then fail "$1: a probe mount was left behind"
+    elif [ "$(probes)" != "$p0" ]; then fail "$1: a probe directory was left in /tmp"
+    else pass "$1"; fi
+}
+if ! command -v sgdisk >/dev/null || ! command -v mkfs.vfat >/dev/null; then
+    echo "  SKIP: sgdisk or mkfs.vfat missing"
+elif ! sgdisk -n 1:2048:+8M -t "1:$IBOOT" -c 1:iBootSystemContainer \
+              -n 2:0:+64M -t 2:EF00 -c 2:EFI \
+              -n 3:0:+64M -t 3:8300 -c 3:BOOT \
+              -n 4:0:0 -t 4:8300 -c 4:root "$IMG11" >/dev/null 2>&1 || ! attach11; then
+    echo "  SKIP: cannot create a partitioned loop device here"
+else
+    mkfs.vfat -n EFI "${L11}p2" >/dev/null
+    mount "${L11}p2" "$WORK/mnt"; mkdir -p "$WORK/mnt/m1n1"; : > "$WORK/mnt/m1n1/boot.bin"; umount "$WORK/mnt"
+    mkfs.ext4 -q -F -L BOOT "${L11}p3"
+    mount "${L11}p3" "$WORK/mnt"; : > "$WORK/mnt/vmlinuz-7.1.13-402.asahi.fc44.aarch64+16k"; umount "$WORK/mnt"
+    cryptsetup luksFormat --type luks1 --iter-time 100 --key-file "$WORK/pass" --batch-mode -q "${L11}p4"
+    refresh11
+    VIEW=$(lsblk -rno NAME,PARTTYPE,FSTYPE "$L11" 2>/dev/null || true)
+    if ! awk -v t="${IBOOT,,}" '$1 ~ /p1$/ && tolower($2) == t { a = 1 }
+                                $1 ~ /p2$/ && $3 == "vfat" { b = 1 }
+                                $1 ~ /p3$/ && $3 == "ext4" { c = 1 }
+                                END { exit !(a && b && c) }' <<< "$VIEW"; then
+        echo "  SKIP: lsblk does not show the image's partition types and filesystems here:"
+        printf '%s\n' "$VIEW" | sed 's/^/    /'
+    else
+        expect_dev "the Apple Silicon boot partition alone flags the LUKS root, nothing mounted" \
+            "0|its disk carries an Apple Silicon boot partition (${L11}p1, iBootSystemContainer)"
+        if retype11 8300; then
+            expect_dev "no Apple partition: m1n1 on the ESP flags it (ESP probe-mounted ro, unchanged, unmounted)" \
+                "0|its disk holds m1n1 on the FAT partition ${L11}p2"
+            mount "${L11}p2" "$WORK/mnt"; rm -rf "$WORK/mnt/m1n1"; umount "$WORK/mnt"; refresh11
+            expect_dev "no m1n1 either: the Asahi kernel on the ext4 /boot flags it (ro,noload, unchanged, unmounted)" \
+                "0|its disk holds an Asahi kernel on ${L11}p3 (vmlinuz-7.1.13-402.asahi.fc44.aarch64+16k)"
+            mount "${L11}p3" "$WORK/mnt"; rm -f "$WORK/mnt"/vmlinuz-*; umount "$WORK/mnt"; refresh11
+            expect_dev "nothing Asahi on the disk: not flagged, and both probes left no trace" "1|"
+            mount "${L11}p2" "$WORK/mnt"; mkdir -p "$WORK/mnt/m1n1"; umount "$WORK/mnt"
+            mount "${L11}p3" "$WORK/mnt"; : > "$WORK/mnt/vmlinuz-7.1.13-402.asahi.fc44.aarch64+16k"; umount "$WORK/mnt"
+        else
+            fail "could not re-type partition 1"
+        fi
+        # The real script. Never on a machine that is itself Asahi: there the
+        # live check refuses first, which is right but tests nothing here.
+        if bash -c '. "$1"; ll_detect_asahi ""' _ "$BIN/lib-deps.sh"; then
+            echo "  SKIP: this machine is Asahi / Apple Silicon — luks-deploy.sh refuses it before any partition is chosen"
+        elif ! command -v unshare >/dev/null; then
+            echo "  SKIP: no unshare(1) for a private mount namespace"
+        elif ! retype11 "$IBOOT"; then
+            fail "could not restore the Apple Silicon boot partition type"
+        else
+            mkdir -p "$WORK/kit"; cp "$BIN"/*.sh "$WORK/kit/"
+            TO11=(); command -v timeout >/dev/null && TO11=(timeout 300)
+            deploy_refuses() {   # $1 = label
+                local out rc=0 h0 h1
+                h0=$(head -c 16M "${L11}p4" | sha256sum)
+                out=$(cd "$WORK/kit" && "${TO11[@]}" unshare --mount --propagation private \
+                        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$WORK" \
+                        LUKS_TARGET_ROOT="${L11}p4" LUKS_LIVE_OVERRIDE=LIVE \
+                        LUKS_BATTERY_OVERRIDE=BATTERY LUKS_EXISTING=quit \
+                        bash ./luks-deploy.sh --dry-run </dev/null 2>&1) || rc=$?
+                h1=$(head -c 16M "${L11}p4" | sha256sum)
+                if [ "$rc" -eq 3 ] && grep -q 'The partition you selected belongs to an Apple Silicon' <<< "$out" \
+                   && grep -q 'Reason: its disk carries an Apple Silicon boot partition' <<< "$out" \
+                   && [ "$h0" = "$h1" ]; then
+                    pass "$1"
+                else
+                    fail "$1: exit $rc, header $([ "$h0" = "$h1" ] && echo unchanged || echo CHANGED): $(tail -n 4 <<< "$out" | tr '\n' ' ')"
+                fi
+            }
+            deploy_refuses "luks-deploy.sh refuses a LUKS1 root on it before the conversion path, header untouched"
+            mk_shrunk_btrfs "${L11}p4"
+            cryptsetup reencrypt "${ENCRYPT_ARGS[@]}" --init-only "${L11}p4"
+            refresh11
+            deploy_refuses "luks-deploy.sh refuses a LUKS2 root mid-encryption before the resume path, header untouched"
+            has_reenc_flag "${L11}p4" \
+                && pass "the interrupted encryption was left for AsahiLocker to resume" \
+                || fail "the online-reencrypt flag is gone: something resumed it"
+            cryptsetup luksFormat --type luks2 "${KDF[@]}" --key-file "$WORK/pass" --batch-mode -q "${L11}p4"
+            refresh11
+            deploy_refuses "luks-deploy.sh refuses a finished LUKS2 root before the tune/config menu, header untouched"
+        fi
+    fi
+fi
+
 echo ""
 echo "==================================================="
 echo "  $PASS passed, $FAIL failed"
