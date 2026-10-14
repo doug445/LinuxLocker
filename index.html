@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Encrypt an existing Linux install with LUKS2 — LinuxLocker</title>
+<meta name="description" content="Add full-disk encryption to a Linux system you already installed: LinuxLocker converts the root filesystem to LUKS2 + argon2id in place, without reinstalling. Fedora, Ubuntu, Mint, Debian, Arch, Manjaro, openSUSE, Raspberry Pi OS.">
+<link rel="canonical" href="https://doug445.github.io/LinuxLocker/">
+<meta name="author" content="William MacKinnon">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0b0f17">
+
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="LinuxLocker">
+<meta property="og:title" content="Encrypt an existing Linux install with LUKS2 — LinuxLocker">
+<meta property="og:description" content="Encrypt the Linux you already installed: LUKS2 + argon2id, in place, no reinstall. GRUB, systemd-boot, UKI and Secure Boot handled; the reboot is gated on a full verification pass.">
+<meta property="og:url" content="https://doug445.github.io/LinuxLocker/">
+<meta property="og:image" content="https://doug445.github.io/LinuxLocker/linuxlocker-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="LinuxLocker: encrypt the Linux you already installed. LUKS2 + argon2id, in place, no reinstall.">
+<meta property="article:published_time" content="2026-10-14">
+<meta property="article:modified_time" content="2026-10-14">
+<meta name="twitter:card" content="summary_large_image">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://doug445.github.io/LinuxLocker/#software",
+      "name": "LinuxLocker",
+      "description": "In-place LUKS2 encryption of the root filesystem of an already-installed Linux system, with the boot configuration for GRUB, systemd-boot and Unified Kernel Images rewritten and verified.",
+      "applicationCategory": "SecurityApplication",
+      "operatingSystem": "Linux (x86_64, aarch64)",
+      "license": "https://opensource.org/licenses/MIT",
+      "url": "https://doug445.github.io/LinuxLocker/",
+      "downloadUrl": "https://github.com/doug445/LinuxLocker",
+      "codeRepository": "https://github.com/doug445/LinuxLocker",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "author": { "@id": "https://doug445.github.io/LinuxLocker/#author" }
+    },
+    {
+      "@type": "TechArticle",
+      "@id": "https://doug445.github.io/LinuxLocker/#article",
+      "headline": "Encrypt an existing Linux install with LUKS2, without reinstalling",
+      "description": "How to add LUKS2 encryption to an installed Linux system in place, and what LinuxLocker automates around cryptsetup reencrypt.",
+      "datePublished": "2026-10-14",
+      "dateModified": "2026-10-14",
+      "image": "https://doug445.github.io/LinuxLocker/linuxlocker-card.png",
+      "author": { "@id": "https://doug445.github.io/LinuxLocker/#author" },
+      "about": { "@id": "https://doug445.github.io/LinuxLocker/#software" },
+      "mainEntityOfPage": "https://doug445.github.io/LinuxLocker/",
+      "proficiencyLevel": "Expert"
+    },
+    {
+      "@type": "Person",
+      "@id": "https://doug445.github.io/LinuxLocker/#author",
+      "name": "William MacKinnon",
+      "url": "https://github.com/doug445",
+      "sameAs": ["https://github.com/doug445"]
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://doug445.github.io/LinuxLocker/#faq",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Can I encrypt Linux after installation, without reinstalling?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. cryptsetup reencrypt --encrypt converts an existing filesystem into a LUKS2 container in place. LinuxLocker runs it from a live USB, rewrites every boot-configuration file the change forces, rebuilds every initramfs, and refuses to let you reboot until the result verifies." }
+        },
+        {
+          "@type": "Question",
+          "name": "Will my files, filesystem UUID and snapshots survive?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. The partition gains an encryption layer; the filesystem inside is the same filesystem with the same UUID, and btrfs subvolumes and snapshots come through untouched. The script re-reads the inner filesystem type and UUID after encryption and fails the run if either changed." }
+        },
+        {
+          "@type": "Question",
+          "name": "Can I encrypt Ubuntu or Linux Mint after installing it?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes, if /boot is on its own partition or the machine boots with systemd-boot or a UKI. Ubuntu, Debian and openSUSE default installs often keep /boot on the root filesystem; under GRUB, LinuxLocker refuses those before touching anything, because GRUB would then have to unlock the disk. A separate unencrypted /boot partition of 1 GiB is the fix." }
+        },
+        {
+          "@type": "Question",
+          "name": "Why is /boot left unencrypted?",
+          "acceptedAnswer": { "@type": "Answer", "text": "So the initramfs, not GRUB, unlocks root with the full argon2id cost of up to 4 GiB per guess. GRUB takes argon2id memory as one allocation from the firmware heap, which on x86 UEFI has never reliably meant more than 1 GiB, and stock GRUB 2.12 cannot open argon2id at all." }
+        },
+        {
+          "@type": "Question",
+          "name": "Does LinuxLocker work with systemd-boot, Unified Kernel Images and Secure Boot?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. systemd-boot entries are patched wherever the ESP is mounted. A UKI is rebuilt with whichever backend owns it (mkinitcpio, kernel-install, dracut or ukify) after the kernel command line is final, its .cmdline section is read back to prove the LUKS arguments are in it, and under Secure Boot it is re-signed with sbctl or sbsign and the signature verified before reboot." }
+        },
+        {
+          "@type": "Question",
+          "name": "Can it unlock with a TPM?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No. LinuxLocker enrolls a passphrase and, optionally, a recovery key. TPM2 enrollment, PCR sealing and network-bound unlock are not implemented; you type the passphrase at boot." }
+        },
+        {
+          "@type": "Question",
+          "name": "What happens if the encryption is interrupted?",
+          "acceptedAnswer": { "@type": "Answer", "text": "LUKS2 re-encryption is journaled with checksum resilience. Re-run the script: it detects the interrupted state, runs cryptsetup repair if the journal is dirty, finishes the re-encryption and redoes the configuration. The one way to lose the disk is to format it before re-running." }
+        }
+      ]
+    }
+  ]
+}
+</script>
+
+<style>
+:root {
+  --bg: #fbfaf8;
+  --surface: #ffffff;
+  --surface-2: #f3f1ee;
+  --text: #1b1a1f;
+  --muted: #5b5866;
+  --border: #e3e0dc;
+  --accent: #0f7a52;
+  --accent-2: #2457c5;
+  --accent-ink: #ffffff;
+  --code-bg: #f1eff5;
+  --warn-bg: #fff5e6;
+  --warn-border: #e8a33a;
+  --ok: #1e7d45;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0b0f17;
+    --surface: #111a26;
+    --surface-2: #16212f;
+    --text: #eef3f8;
+    --muted: #9fb0c2;
+    --border: #2b3d52;
+    --accent: #3ddc97;
+    --accent-2: #6aa1ff;
+    --accent-ink: #06130d;
+    --code-bg: #121c28;
+    --warn-bg: #261c0c;
+    --warn-border: #c9862a;
+    --ok: #5fd48f;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0b0f17;
+  --surface: #111a26;
+  --surface-2: #16212f;
+  --text: #eef3f8;
+  --muted: #9fb0c2;
+  --border: #2b3d52;
+  --accent: #3ddc97;
+  --accent-2: #6aa1ff;
+  --accent-ink: #06130d;
+  --code-bg: #121c28;
+  --warn-bg: #261c0c;
+  --warn-border: #c9862a;
+  --ok: #5fd48f;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-padding-top: 1rem; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 17px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+a { color: var(--accent-2); text-underline-offset: 2px; }
+a:hover { color: var(--accent); }
+.wrap { max-width: 860px; margin: 0 auto; padding: 0 16px; }
+
+header.hero { padding: 2.5rem 0 1.5rem; border-bottom: 1px solid var(--border); }
+.hero img {
+  display: block; width: 100%; height: auto; border-radius: 14px;
+  border: 1px solid var(--border); margin-bottom: 1.75rem;
+}
+.eyebrow {
+  font-size: .8rem; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted); margin: 0 0 .5rem;
+}
+h1 { font-size: clamp(1.9rem, 5vw, 2.7rem); line-height: 1.15; margin: 0 0 1rem; letter-spacing: -.01em; }
+h2 { font-size: 1.6rem; line-height: 1.25; margin: 3rem 0 .75rem; padding-top: .5rem; }
+h3 { font-size: 1.2rem; margin: 2rem 0 .5rem; }
+p, ul, ol { margin: 0 0 1rem; }
+li { margin: .3rem 0; }
+.lede { font-size: 1.15rem; color: var(--text); }
+
+.cta { display: flex; flex-wrap: wrap; gap: .75rem; margin: 1.5rem 0 1rem; }
+.btn {
+  display: inline-block; padding: .65rem 1.1rem; border-radius: 9px;
+  font-weight: 600; text-decoration: none; border: 1px solid var(--border);
+  color: var(--text); background: var(--surface);
+}
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn:hover { filter: brightness(1.08); color: inherit; }
+.btn.primary:hover { color: var(--accent-ink); }
+
+.facts { display: flex; flex-wrap: wrap; gap: .5rem; padding: 0; list-style: none; margin: 1rem 0 0; }
+.facts li {
+  margin: 0; font-size: .85rem; padding: .25rem .65rem; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
+}
+
+nav.toc {
+  margin: 2rem 0 0; padding: 1rem 1.25rem; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 12px;
+}
+nav.toc h2 { font-size: 1rem; margin: 0 0 .5rem; padding: 0; }
+nav.toc ol { columns: 2; column-gap: 2rem; margin: 0; padding-left: 1.2rem; font-size: .95rem; }
+@media (max-width: 600px) { nav.toc ol { columns: 1; } }
+
+.note {
+  border-left: 4px solid var(--warn-border); background: var(--warn-bg);
+  padding: .9rem 1.1rem; border-radius: 0 10px 10px 0; margin: 1.25rem 0;
+}
+.note p:last-child { margin-bottom: 0; }
+
+pre, code { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+code { font-size: .88em; background: var(--code-bg); padding: .1em .35em; border-radius: 5px; }
+.codeblock { position: relative; margin: 1rem 0 1.25rem; }
+pre {
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px;
+  padding: 1rem 1.1rem; overflow-x: auto; font-size: .87rem; line-height: 1.55; margin: 0;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+.copy {
+  position: absolute; top: .5rem; right: .5rem; font: 600 .75rem/1 system-ui, sans-serif;
+  padding: .4rem .6rem; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--muted); cursor: pointer;
+}
+.copy:hover { color: var(--text); }
+
+.table-scroll { overflow-x: auto; margin: 1rem 0 1.25rem; border: 1px solid var(--border); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: .93rem; background: var(--surface); }
+th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { background: var(--surface-2); font-weight: 600; }
+tr:last-child td { border-bottom: 0; }
+
+.chain { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; margin: 1rem 0; font-size: .9rem; }
+.chain span {
+  padding: .35rem .65rem; border-radius: 7px; background: var(--surface);
+  border: 1px solid var(--border); font-family: ui-monospace, Menlo, monospace;
+}
+.chain span.hot { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.chain i { color: var(--muted); font-style: normal; }
+
+ol.steps { counter-reset: s; list-style: none; padding: 0; }
+ol.steps > li {
+  counter-increment: s; position: relative; padding: 0 0 0 3rem; margin: 0 0 1.75rem;
+}
+ol.steps > li::before {
+  content: counter(s); position: absolute; left: 0; top: .1rem;
+  width: 2rem; height: 2rem; border-radius: 50%; display: grid; place-items: center;
+  background: var(--accent); color: var(--accent-ink); font-weight: 700; font-size: .95rem;
+}
+ol.steps > li > h3 { margin-top: 0; }
+
+figure { margin: 1.5rem 0; }
+figure img { max-width: 100%; height: auto; border-radius: 10px; border: 1px solid var(--border); display: block; margin: 0 auto; }
+figcaption { font-size: .88rem; color: var(--muted); text-align: center; margin-top: .5rem; }
+
+details {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  margin: .6rem 0; padding: 0 1rem;
+}
+details[open] { padding-bottom: .5rem; }
+summary { cursor: pointer; font-weight: 600; padding: .85rem 0; list-style-position: outside; }
+details p { margin: .25rem 0 .75rem; }
+
+.ok { color: var(--ok); font-weight: 600; }
+
+footer {
+  margin-top: 4rem; padding: 2rem 0 3rem; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: .9rem;
+}
+footer p { margin: 0 0 .5rem; }
+
+.warnbox { border-left-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <img src="linuxlocker-card.png" width="1200" height="630" fetchpriority="high"
+         alt="LinuxLocker: encrypt the Linux you already installed. LUKS2 + argon2id, in place, no reinstall. Fedora, Ubuntu, Mint, Debian, Arch, Manjaro, openSUSE, Raspberry Pi OS; GRUB, systemd-boot and UKI.">
+    <p class="eyebrow">Any distro family · x86_64 and ARM · LUKS2</p>
+    <h1>Encrypt an existing Linux install with LUKS2, without reinstalling</h1>
+    <p class="lede">
+      Most installers only offer disk encryption at install time. <strong>LinuxLocker</strong>
+      adds it afterwards. It converts the root filesystem of a system you have already installed
+      into a LUKS2 container holding that same filesystem, then rewrites every piece of boot
+      configuration the change forces: GRUB, BLS and systemd-boot entries, Unified Kernel Images,
+      initramfs images. It refuses to let you reboot until the result verifies.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/doug445/LinuxLocker">Get it on GitHub</a>
+      <a class="btn" href="#step-by-step">Step-by-step guide</a>
+      <a class="btn" href="#check-first">Will it work on my machine?</a>
+    </div>
+    <ul class="facts" aria-label="At a glance">
+      <li>MIT licence</li>
+      <li>argon2id only, never pbkdf2</li>
+      <li>AES-256-XTS</li>
+      <li>GRUB · systemd-boot · UKI</li>
+      <li>Secure Boot re-signing</li>
+      <li>Resumable</li>
+      <li>--dry-run</li>
+    </ul>
+  </div>
+</header>
+
+<main class="wrap">
+
+<nav class="toc" aria-label="Contents">
+  <h2>On this page</h2>
+  <ol>
+    <li><a href="#check-first">Will it work on my machine?</a></li>
+    <li><a href="#what-it-does">What LinuxLocker does</a></li>
+    <li><a href="#distros">Supported distros</a></li>
+    <li><a href="#boot">GRUB, systemd-boot, UKI, Secure Boot</a></li>
+    <li><a href="#filesystems">Filesystems</a></li>
+    <li><a href="#verified">What is verified, and what is not yet</a></li>
+    <li><a href="#step-by-step">Step by step</a></li>
+    <li><a href="#kdf">argon2id profiles</a></li>
+    <li><a href="#manual-vs">Manual vs LinuxLocker</a></li>
+    <li><a href="#risks">Risks</a></li>
+    <li><a href="#faq">FAQ</a></li>
+    <li><a href="#further">Further reading</a></li>
+  </ol>
+</nav>
+
+<h2 id="check-first">Will it work on my machine? Check this first</h2>
+<ul>
+  <li><strong>Your <code>/boot</code> must be a separate partition if you boot with GRUB or
+    extlinux.</strong> Fedora-family installs always have one. <strong>Ubuntu, Debian and openSUSE
+    defaults often keep <code>/boot</code> on the root filesystem</strong>, and LinuxLocker refuses
+    those before touching anything: GRUB would then have to unlock the disk, which this tool never
+    sets up. Check with <code>findmnt /boot</code>. No output means <code>/boot</code> is on root.
+    Machines that boot systemd-boot, a UKI or a Raspberry Pi keep the kernel on the ESP or firmware
+    partition and are fine.</li>
+  <li><strong>Your root filesystem must be shrinkable by 32 MiB</strong>, for the LUKS2 header:
+    ext2/3/4, btrfs and f2fs are. xfs cannot shrink and works only with 32 MiB of slack already at
+    the end of the partition.</li>
+  <li><strong>Not on a Mac with Apple Silicon.</strong> Running Fedora Asahi Remix? Use
+    <a href="https://doug445.github.io/AsahiLocker/">AsahiLocker</a> instead. LinuxLocker
+    detects Asahi and exits before touching any device.</li>
+  <li><strong>You need a live USB</strong> for the machine (the target distro's own live ISO is
+    safest), <strong>a verified backup</strong>, and AC power on a laptop.</li>
+</ul>
+
+<h2 id="what-it-does">What LinuxLocker does</h2>
+<ol>
+  <li><strong>Detects</strong> the partitions, the target OS from its own
+    <code>/etc/os-release</code>, the filesystem and subvolumes, and the boot partitions. It takes
+    those from <strong>the target's own fstab</strong>, not from guesses.</li>
+  <li><strong>Installs missing tools</strong> with the live system's package manager: dnf, apt,
+    pacman, zypper, apk, xbps or emerge.</li>
+  <li><strong>Shrinks</strong> the filesystem by 32 MiB to make room for the header.</li>
+  <li><strong>Encrypts in place</strong> with <code>cryptsetup reencrypt --encrypt</code>:
+    AES-256-XTS, argon2id, sha512, checksum resilience.</li>
+  <li><strong>Verifies</strong> the header, opens the container, confirms the inner filesystem
+    type and UUID are unchanged, and grows the filesystem back.</li>
+  <li><strong>Rewrites boot configuration</strong> for whatever this target uses, then rebuilds
+    <strong>every</strong> initramfs in a chroot. Any image that comes out without
+    <code>cryptsetup</code> or <code>dm-crypt</code> is rebuilt again.</li>
+  <li><strong>Rebuilds and re-signs the Unified Kernel Image</strong>, if the target boots
+    one.</li>
+  <li><strong>Gates the reboot</strong> behind a verification pass. A check that doesn't apply
+    to this target is reported as SKIP, never silently passed.</li>
+</ol>
+<p>
+  Re-run it any time. If it finds an interrupted encryption, it finishes it. If it finds an
+  already-encrypted volume, it offers to strengthen the KDF or redo the boot config. A LUKS1
+  volume can be converted to LUKS2 in place. A partition with no <code>/etc/fstab</code> inside
+  is a data disk, and gets encrypted with no boot changes at all.
+</p>
+
+<h2 id="distros">Supported distros</h2>
+<p>Support depends on what is <em>installed on the target</em>, not on the distro's name, so
+  derivatives inherit it from their family.</p>
+<div class="table-scroll"><table>
+  <thead><tr><th>Family</th><th>Initramfs</th><th>Boot config handled</th></tr></thead>
+  <tbody>
+    <tr><td>Fedora · RHEL · Rocky · Alma</td><td>dracut</td><td>GRUB defaults, BLS entries, <code>/etc/kernel/cmdline</code>, <code>rd.luks.*</code></td></tr>
+    <tr><td>Debian · Ubuntu · Mint · Pop!_OS</td><td>initramfs-tools</td><td><code>crypttab</code> with <code>initramfs</code>, <code>update-grub</code>, installs <code>cryptsetup-initramfs</code> if missing</td></tr>
+    <tr><td>Arch · Manjaro · EndeavourOS</td><td>mkinitcpio</td><td><code>encrypt</code> or <code>sd-encrypt</code> hook, <code>cryptdevice=</code> / <code>rd.luks.*</code></td></tr>
+    <tr><td>openSUSE</td><td>dracut</td><td>GRUB defaults, <code>rd.luks.*</code></td></tr>
+    <tr><td>Raspberry Pi OS</td><td>initramfs-tools</td><td><code>cmdline.txt</code> <code>root=</code>, <code>auto_initramfs=1</code></td></tr>
+    <tr><td>ARM boards on U-Boot distro-boot</td><td>any of the above</td><td><code>extlinux.conf</code> <code>APPEND</code></td></tr>
+  </tbody>
+</table></div>
+<p>Every kernel command-line carrier is found and rewritten, including Ubuntu's
+  <code>grub.d</code> drop-ins, <code>refind_linux.conf</code> and <code>limine.conf</code>. A
+  <code>root=PARTUUID=</code> that names the raw partition is pointed at the mapper.</p>
+
+<h2 id="boot">GRUB, systemd-boot, Unified Kernel Images and Secure Boot</h2>
+<div class="table-scroll"><table>
+  <thead><tr><th>Boot stack</th><th>What happens</th></tr></thead>
+  <tbody>
+    <tr><td><strong>GRUB</strong> (+ BLS)</td><td>Defaults, drop-ins and every BLS entry patched; config regenerated.</td></tr>
+    <tr><td><strong>systemd-boot</strong></td><td>Detected from the loader on the ESP; entries patched with the ESP at <code>/efi</code>, <code>/boot/efi</code> or <code>/boot</code>, with or without XBOOTLDR.</td></tr>
+    <tr><td><strong>UKI</strong></td><td>The <code>.efi</code> is <strong>rebuilt</strong> with the backend that owns it (mkinitcpio <code>_uki=</code>, <code>kernel-install</code> <code>layout=uki</code>, <code>dracut --uki-file</code> or <code>ukify</code>), and its <code>.cmdline</code> section is read back to prove the LUKS arguments are in it.</td></tr>
+    <tr><td><strong>Secure Boot + UKI</strong></td><td>Re-signed with <code>sbctl</code> or <code>sbsign</code>; the reboot is refused if any UKI came out unsigned.</td></tr>
+    <tr><td><strong>Secure Boot, no UKI</strong></td><td>Nothing to do: the initramfs isn't in the verified chain, and shim, the bootloader and <code>vmlinuz</code> are never touched.</td></tr>
+  </tbody>
+</table></div>
+<div class="note warnbox"><p>Why this matters on Arch and Manjaro: <code>sbctl</code>'s signing
+  hook is a <em>pacman</em> hook. It fires on package transactions, not when something runs
+  <code>mkinitcpio -P</code> by hand. A UKI rebuilt any other way comes out unsigned, and a Secure
+  Boot machine then refuses to load it. LinuxLocker signs the UKI itself and verifies the
+  signature.</p></div>
+
+<h2 id="filesystems">Filesystems</h2>
+<div class="table-scroll"><table>
+  <thead><tr><th>Filesystem</th><th>In place?</th></tr></thead>
+  <tbody>
+    <tr><td>ext4 · ext3 · ext2</td><td>Yes: <code>resize2fs</code> shrink → encrypt → grow</td></tr>
+    <tr><td>btrfs</td><td>Yes: online resize; subvolume layouts auto-detected</td></tr>
+    <tr><td>f2fs</td><td>Yes, with f2fs-tools ≥ 1.16</td></tr>
+    <tr><td>xfs</td><td>Only with ≥ 32 MiB of existing slack at the end of the partition (xfs cannot shrink)</td></tr>
+    <tr><td>ntfs · vfat</td><td>Yes, for data partitions</td></tr>
+    <tr><td>exfat · udf · swap</td><td>No: <a href="https://github.com/doug445/LinuxLocker/blob/main/docs/FILESYSTEMS.md">workarounds here</a></td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="verified">What is verified, and what is not yet</h2>
+<p>An encryption tool should tell you exactly what has been proven on real hardware. Here it is:</p>
+<ul>
+  <li><span class="ok">Verified in production:</span> Manjaro on an x86_64 ASUS ZenBook (btrfs
+    with snapper, systemd-boot, UKIs from mkinitcpio, Secure Boot with sbctl). It runs the
+    strongest profile in daily use; its journal records 56 real boots, and the unlock
+    times below are measured from them.</li>
+  <li><span class="ok">Tested in CI on every push, on x86_64 and aarch64:</span> a loopback suite
+    that does the real shrink, in-place encryption, hard-kill-and-resume, recovery-key enrolment
+    and LUKS1 → LUKS2 conversion against throwaway loop devices, plus fixture suites covering
+    every UKI, systemd-boot and command-line layout. None of these is a boot.</li>
+  <li><strong>Not yet boot-tested end to end:</strong> the Fedora, Ubuntu and Arch
+    <em>GRUB</em> paths. The code and tests cover them, but no real machine has yet been
+    encrypted and booted on those paths. If yours is one,
+    <a href="https://github.com/doug445/LinuxLocker/issues">a report is very welcome</a>, and a
+    <code>--dry-run</code> first is strongly recommended.</li>
+</ul>
+
+<h2 id="step-by-step">Step by step</h2>
+<ol class="steps">
+  <li>
+    <h3>Back up, and check the list above</h3>
+    <p>A backup you have actually restored from or browsed. In-place encryption rewrites every
+      sector of the partition.</p>
+  </li>
+  <li>
+    <h3>Put the kit on a USB drive</h3>
+<div class="codeblock"><pre><code>git clone https://github.com/doug445/LinuxLocker.git</code></pre></div>
+    <p>Put it on media that survives a reboot, not in the live session's RAM. Logs, the
+      pre-encryption state and the recovery key are written next to the scripts.</p>
+  </li>
+  <li>
+    <h3>Boot a live USB for the machine</h3>
+    <p>The target distro's own live ISO is safest, because its <code>cryptsetup</code> and
+      filesystem tools match the target. Any live Linux with <code>cryptsetup</code> 2.4 or
+      later works. The script refuses to run from the installed system itself.</p>
+  </li>
+  <li>
+    <h3>Rehearse, then run</h3>
+<div class="codeblock"><pre><code>sudo /path/to/LinuxLocker/bin/linuxlocker.sh deploy --dry-run
+sudo /path/to/LinuxLocker/bin/linuxlocker.sh</code></pre></div>
+    <p>The dry run prints everything it detected and the exact <code>cryptsetup</code> command,
+      and changes nothing. The real run detects the live OS, installs what it needs, and walks
+      you through it: pick the root partition from a scored menu, run an optional read-only fsck,
+      choose a KDF profile benchmarked on this machine, and type <code>ENCRYPT</code>. Just
+      before the passphrase prompt it asks for a lower-case <code>yes</code>, which can't be
+      typed with Caps Lock on.</p>
+    <p>Everything after that is automated. <strong>Do not reboot if the gate reports
+      errors</strong>: it prints exactly what failed.</p>
+  </li>
+  <li>
+    <h3>First encrypted boot</h3>
+    <p>The splash is stripped for this boot so the passphrase prompt stays visible. If the screen
+      looks hung, type the passphrase and press Enter.</p>
+  </li>
+  <li>
+    <h3>Finish on the encrypted system</h3>
+<div class="codeblock"><pre><code>sudo /path/to/LinuxLocker/bin/post-encryption-setup.sh</code></pre></div>
+    <p>This saves a recovery bundle, restores the splash and verifies the system end to end. Then
+      <strong>move the recovery key and header backup to offline storage</strong>, and take a
+      fresh backup.</p>
+  </li>
+</ol>
+
+<h2 id="kdf">argon2id profiles</h2>
+<p>
+  Every keyslot is argon2id. There is no pbkdf2 profile and no flag to get one, and
+  <code>fast</code> is a hard floor. argon2id's cost is <em>memory</em>: every guess against your
+  disk must hold 1–4 GiB of RAM, on a GPU, an ASIC or anything else. RAM does not get cheaper for
+  an attacker than it does for you.
+</p>
+<div class="table-scroll"><table>
+  <thead><tr><th>Profile</th><th>Memory</th><th>Iterations</th><th>Unlock time*</th></tr></thead>
+  <tbody>
+    <tr><td><code>aggressive</code></td><td>4 GiB</td><td>10</td><td><strong>~16 s</strong> (measured over 56 boots)</td></tr>
+    <tr><td><code>moderate</code> (default)</td><td>2 GiB</td><td>8</td><td>~8 s</td></tr>
+    <tr><td><code>fast</code></td><td>1 GiB</td><td>9</td><td>~4 s</td></tr>
+  </tbody>
+</table></div>
+<p><small>* Intel Core i7-10510U laptop. The installer benchmarks <em>your</em> machine and shows
+  your own numbers before you choose, and it refuses any profile whose memory cost exceeds your
+  RAM. Already encrypted with weak settings? <code>luks-tune.sh</code> re-costs existing keyslots
+  upward, without re-encrypting anything.</small></p>
+
+<h2 id="manual-vs">Manual encryption vs LinuxLocker</h2>
+<div class="table-scroll"><table>
+  <thead><tr><th></th><th>By hand</th><th>LinuxLocker</th></tr></thead>
+  <tbody>
+    <tr><td>Filesystem shrink</td><td>You pick the resize tool and size</td><td>Per-filesystem handler, 32 MiB, re-run safe</td></tr>
+    <tr><td>Which distro?</td><td>Follow the matching guide</td><td>Detected from the target's own files</td></tr>
+    <tr><td>KDF</td><td><code>cryptsetup</code> auto-benchmark, sha256</td><td>Pinned argon2id + sha512, with a floor</td></tr>
+    <tr><td>Boot config</td><td>Edit crypttab, fstab, cmdline and bootloader config by hand</td><td>Every carrier this target uses, rewritten</td></tr>
+    <tr><td>Initramfs</td><td>Rebuild and hope the module is in</td><td>Every image rebuilt, checked, self-repaired</td></tr>
+    <tr><td>UKI / Secure Boot</td><td>Find out after reboot that the old cmdline is baked in, or the signature broke</td><td>Rebuilt, re-signed, read back and verified</td></tr>
+    <tr><td>Did it work?</td><td>You find out at reboot</td><td>The gate refuses the reboot until it passes</td></tr>
+    <tr><td>Interrupted</td><td>Debug the header yourself</td><td>Detected and resumed</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="risks">Risks: read these</h2>
+<ul>
+  <li><strong>Choosing the wrong partition is catastrophic.</strong> The script cross-checks your
+    pick against the target's fstab and makes you type <code>ENCRYPT</code>, but you are the
+    final authority.</li>
+  <li><strong>Power loss mid-encryption</strong> is recoverable. Re-run the script, but don't
+    format anything in a panic first.</li>
+  <li><strong>Forget the passphrase</strong> with no recovery key enrolled, and the data is
+    gone.</li>
+  <li><strong>No TPM unlock.</strong> You type the passphrase at every boot.</li>
+  <li><strong>Encrypted <code>/boot</code> is never set up.</strong> An existing GRUB-unlocked
+    volume is recognised and kept within what that GRUB can open.</li>
+</ul>
+
+<h2 id="faq">Frequently asked questions</h2>
+<details>
+  <summary>Can I encrypt Linux after installation, without reinstalling?</summary>
+  <p>Yes, that is the whole point. <code>cryptsetup reencrypt --encrypt</code> converts an existing
+    filesystem to LUKS2 in place. LinuxLocker automates that plus every boot change it forces, and
+    refuses to let you reboot until the result verifies.</p>
+</details>
+<details>
+  <summary>Will my files, filesystem UUID and snapshots survive?</summary>
+  <p>Yes. The filesystem inside the container is the same filesystem with the same UUID, and btrfs
+    subvolumes and snapshots come through untouched. The script checks the inner type and UUID
+    after encryption and fails the run if either changed.</p>
+</details>
+<details>
+  <summary>Can I encrypt Ubuntu or Linux Mint after installing it?</summary>
+  <p>Yes, if <code>/boot</code> is its own partition, or the machine boots systemd-boot or a UKI.
+    Ubuntu's default install often puts <code>/boot</code> on the root filesystem. Under GRUB,
+    LinuxLocker refuses that before touching anything. The fix is a separate, unencrypted
+    <code>/boot</code> partition of about 1 GiB.</p>
+</details>
+<details>
+  <summary>Why is <code>/boot</code> left unencrypted?</summary>
+  <p>So the initramfs unlocks root at the full argon2id cost of up to 4 GiB per guess. GRUB can't
+    do that: it takes argon2id memory as one allocation from the firmware heap, which on x86 UEFI
+    has never reliably meant more than 1 GiB, and stock GRUB 2.12 cannot open argon2id at all. An
+    encrypted <code>/boot</code> would become the cheapest way into the machine.</p>
+</details>
+<details>
+  <summary>Does it work on a Raspberry Pi or another ARM board?</summary>
+  <p>Yes. Raspberry Pi OS is a first-class target (<code>cmdline.txt</code> and
+    <code>auto_initramfs=1</code>), and ARM boards on U-Boot distro-boot get their
+    <code>extlinux.conf</code> rewritten. The 4 GiB profile needs about 6 GiB free at unlock, and
+    the installer refuses profiles larger than your RAM.</p>
+</details>
+<details>
+  <summary>Does it work with Secure Boot?</summary>
+  <p>Yes. Without a UKI, there's nothing to do: the initramfs isn't part of the verified chain.
+    With a UKI, the rebuilt <code>.efi</code> is re-signed with <code>sbctl</code> or
+    <code>sbsign</code>, and the reboot is refused unless the signature verifies. pesign/NSS
+    setups are detected and refused with an explanation rather than left unsigned.</p>
+</details>
+<details>
+  <summary>Can it unlock with a TPM, or with no passphrase?</summary>
+  <p>No. It enrolls a passphrase and, optionally, a recovery key. TPM2, PCR sealing and
+    network-bound unlock are not implemented.</p>
+</details>
+<details>
+  <summary>What if the encryption is interrupted?</summary>
+  <p>LUKS2 re-encryption is journaled. Re-run the script. It detects the interrupted state,
+    repairs the journal if needed, finishes, and redoes the configuration.</p>
+</details>
+<details>
+  <summary>Can I encrypt a second data disk instead?</summary>
+  <p>Yes. A partition with no <code>/etc/fstab</code> inside is offered data-partition mode:
+    encrypt, enroll a recovery key, back up the header, no boot changes.</p>
+</details>
+<details>
+  <summary>I'm on a Mac with Apple Silicon.</summary>
+  <p>Use <a href="https://doug445.github.io/AsahiLocker/">AsahiLocker</a>. It does the same job
+    with the boot guards Fedora Asahi Remix needs. LinuxLocker detects Asahi and exits before
+    touching any device.</p>
+</details>
+<details>
+  <summary>How do I know it is safe to run?</summary>
+  <p>Don't take it on trust. Run <code>deploy --dry-run</code> and read the plan, and read
+    <a href="#verified">what is verified</a> above. The audits so far, and who did them, are
+    recorded in the <a href="https://github.com/doug445/LinuxLocker#audit">README</a>.</p>
+</details>
+
+<h2 id="further">Further reading</h2>
+<ul>
+  <li><a href="https://wiki.archlinux.org/title/Dm-crypt/Device_encryption#Encrypt_an_existing_unencrypted_file_system">Arch Wiki: Encrypt an existing unencrypted file system</a>, the manual method in detail.</li>
+  <li><a href="https://man7.org/linux/man-pages/man8/cryptsetup-reencrypt.8.html"><code>cryptsetup-reencrypt</code>(8)</a>, the command underneath all of this.</li>
+  <li><a href="https://github.com/doug445/LinuxLocker/blob/main/docs/INSTALL.md">INSTALL.md</a> ·
+    <a href="https://github.com/doug445/LinuxLocker/blob/main/docs/BOOTLOADERS.md">BOOTLOADERS.md</a> ·
+    <a href="https://github.com/doug445/LinuxLocker/blob/main/docs/FILESYSTEMS.md">FILESYSTEMS.md</a> ·
+    <a href="https://github.com/doug445/LinuxLocker/blob/main/docs/RECOVERY.md">RECOVERY.md</a></li>
+  <li><a href="https://doug445.github.io/AsahiLocker/">AsahiLocker</a>, the Apple Silicon sibling.</li>
+</ul>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p><strong>LinuxLocker</strong> by William MacKinnon
+      (<a href="https://github.com/doug445">doug445</a>) ·
+      <a href="https://github.com/doug445/LinuxLocker">Source on GitHub</a> ·
+      <a href="https://github.com/doug445/LinuxLocker/releases">Releases</a> ·
+      <a href="https://github.com/doug445/LinuxLocker/issues">Issues</a></p>
+    <p>Copyright © 2026 William MacKinnon. Code under the MIT licence. Page last updated 14 October 2026.</p>
+  </div>
+</footer>
+
+<script>
+document.querySelectorAll('.codeblock').forEach(function (block) {
+  var btn = document.createElement('button');
+  btn.className = 'copy';
+  btn.type = 'button';
+  btn.textContent = 'Copy';
+  btn.addEventListener('click', function () {
+    var text = block.querySelector('code').innerText;
+    navigator.clipboard.writeText(text).then(function () {
+      btn.textContent = 'Copied';
+      setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+    }).catch(function () { btn.textContent = 'Select + copy'; });
+  });
+  block.appendChild(btn);
+});
+</script>
+</body>
+</html>

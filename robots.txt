@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://doug445.github.io/LinuxLocker/sitemap.xml
