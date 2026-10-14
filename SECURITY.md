@@ -162,7 +162,8 @@ interesting surface:
   redaction failing to apply when it was not disabled with `--no-redact`.
 * **A read-only tool that writes.** `luks-tune.sh` must never create or destroy
   a keyslot, change a passphrase, or touch data; `--dry-run` anywhere must reach
-  no point of no return; `extras/luks-fetch-cache` must read public header
+  no point of no return and write nothing to the target;
+  `extras/luks-fetch-cache` must read public header
   metadata and nothing else, and its cache at `/var/cache/luks-fetch.txt` is
   world-readable by design, so anything resembling key material appearing in it
   is a finding; `bin/linuxlocker-diag.sh` must mount nothing read-write and

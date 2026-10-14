@@ -86,8 +86,14 @@ esac
 # --dry-run (or LUKS_DRY_RUN=1): run every read-only phase — detection, menus,
 # fstab cross-checks, KDF benchmark, state backup to the deployment drive —
 # print the full plan, and exit BEFORE the point of no return. Nothing on the
-# TARGET is modified (config-only dry-run still asks for the passphrase to
-# unlock the container for discovery; all discovery mounts are read-only).
+# TARGET is modified. Discovery mounts are read-only and replay no journal
+# (ll_ro_mount); a config-only dry run still asks for the passphrase and
+# opens the container to read it. A step that would change something before
+# the plan is complete — finishing an interrupted encryption, converting a
+# LUKS1 header, handing over to luks-tune.sh, closing a mapper or unmounting
+# what an earlier run left mounted — is not taken: the dry run prints what it
+# would do and stops there, whatever LUKS_RESUME, LUKS_EXISTING or
+# LUKS_STALE_MAPPER say. At exit it undoes only its own mounts and mapper.
 DRY_RUN="${LUKS_DRY_RUN:-0}"
 for arg in "$@"; do
     case "$arg" in
@@ -361,6 +367,31 @@ harden_path() {                        # harden_path <octal-mode> <path>
     return 0
 }
 
+# ─── Read-only mounts that replay no journal in a dry run ────────────────────
+# "ro" alone does not mean "no writes": a dirty ext3/ext4, xfs, btrfs or f2fs
+# replays its journal even on a read-only mount, and the replay is written to
+# the device. A dry run writes nothing to the target, so its read-only mounts
+# also skip the replay — noload (ext3/ext4), norecovery (xfs, f2fs),
+# rescue=nologreplay or the older nologreplay (btrfs) — and read the
+# filesystem as it stands on disk. A real run mounts with plain "ro", as it
+# always has: it is about to write to the target anyway. lib-uki.sh's
+# uki_probe_dev mounts through this too when it is defined.
+# --- ll_ro_mount ---
+ll_ro_mount() {   # ll_ro_mount <dev> <dir> [extra mount options]
+    local dev="$1" dir="$2" extra="${3:+,$3}" nr=""
+    if [ "$DRY_RUN" = "1" ]; then
+        case "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" in
+            ext3|ext4) nr=",noload" ;;
+            xfs|f2fs)  nr=",norecovery" ;;
+            btrfs)
+                mount -o "ro,rescue=nologreplay$extra" "$dev" "$dir" 2>/dev/null && return 0
+                nr=",nologreplay" ;;
+        esac
+    fi
+    mount -o "ro$nr$extra" "$dev" "$dir"
+}
+# --- end ll_ro_mount ---
+
 # ─── LUKS2 KDF profiles ──────────────────────────────────────────────────────
 # Three presets, chosen interactively before encryption starts. The KDF is
 # re-run in the INITRAMFS at every boot, so its memory cost must be allocatable
@@ -439,7 +470,10 @@ harden_path() {                        # harden_path <octal-mode> <path>
 #                                See docs/BOOTLOADERS.md for all of the above.
 #   LUKS_DRY_RUN=1 (or --dry-run flag)  preview: full detection + plan, no
 #                                       changes to the target, exit before
-#                                       the point of no return
+#                                       the point of no return — or earlier,
+#                                       saying what it would do, at a step
+#                                       that would change something (see
+#                                       "CLI flags" above)
 #   LUKS_GRUB_KDF_FACTOR=<x>     unlock-time multiplier shown for a volume that
 #                                GRUB itself unlocks (encrypted /boot). Default
 #                                8.5, measured on one machine; see lib-boot.sh
@@ -860,6 +894,14 @@ fs_grow_max() {
 }
 
 # ─── Cleanup Trap ────────────────────────────────────────────────────────────
+# A dry run undoes only what it did itself. It never mounts anything under
+# /mnt and never writes there, so whatever is mounted under /mnt belongs to an
+# earlier run or to you — and unmounting a read-write filesystem writes to it.
+# It closes ${LUKS_NAME} only when it opened it, and unmounts /mnt_temp only
+# when it mounted it there. A real run cleans up as it always has.
+MNT_TEMP_MOUNTED_HERE=0     # 1 once this run has mounted something at /mnt_temp
+MAPPER_OPENED_HERE=0        # 1 once this run has opened /dev/mapper/${LUKS_NAME}
+# --- cleanup ---
 cleanup() {
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
@@ -867,6 +909,29 @@ cleanup() {
         err "════════════════════════════════════════════════════════════"
         err "  Script exited with error (code $exit_code). Cleaning up..."
         err "════════════════════════════════════════════════════════════"
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+        if [ "$MNT_TEMP_MOUNTED_HERE" = "1" ]; then
+            umount -R /mnt_temp 2>/dev/null || umount /mnt_temp 2>/dev/null || true
+            rmdir /mnt_temp 2>/dev/null || true
+        fi
+        for uki_probe_dir in /tmp/luks-uki-probe.* /tmp/luks-grub-probe.* /tmp/luks-asahi-probe.*; do
+            [ -d "$uki_probe_dir" ] || continue
+            umount "$uki_probe_dir" 2>/dev/null || true
+            rmdir "$uki_probe_dir" 2>/dev/null || true
+        done
+        cryptsetup close "luks-probe-$$" 2>/dev/null || true
+        if [ "$MAPPER_OPENED_HERE" = "1" ]; then
+            cryptsetup close "${LUKS_NAME}" 2>/dev/null || true
+        fi
+        if [ $exit_code -ne 0 ]; then
+            echo ""
+            echo "  [dry-run] Nothing on the target was changed."
+            echo "  Full log: $DEPLOY_LOG"
+        fi
+        sync
+        sleep 1
+        return
     fi
     # Clean up any temp mounts first (-R: the BLS check nests a boot mount
     # inside /mnt_temp, and a plain umount would fail on the child mount)
@@ -913,6 +978,7 @@ cleanup() {
     sync
     sleep 1
 }
+# --- end cleanup ---
 trap cleanup EXIT
 
 # ─── Root Check ──────────────────────────────────────────────────────────────
@@ -932,20 +998,41 @@ if [ -b /dev/mapper/${LUKS_NAME} ]; then
     echo "  keep  = leave it open and reuse it (saves a passphrase prompt in config-only mode)"
     echo "  close = close it and start fresh"
     ask STALE_CHOICE LUKS_STALE_MAPPER "Keep or close? (keep/close): "
-    umount -R /mnt 2>/dev/null || true
-    case "$STALE_CHOICE" in
-        keep)
-            log "  Keeping ${LUKS_NAME} open — it will be reused."
-            ;;
-        close)
-            cryptsetup close ${LUKS_NAME} 2>/dev/null \
-                || fatal "Could not close ${LUKS_NAME} (still in use?). Close it manually and re-run."
-            log "  Closed stale ${LUKS_NAME}."
-            ;;
-        *)
-            fatal "Answer 'keep' or 'close'. Nothing was changed."
-            ;;
-    esac
+    if [ "$DRY_RUN" = "1" ]; then
+        # A dry run unmounts and closes nothing. Kept, the mapper is read as
+        # it stands; closing it would be a change, so the dry run stops there.
+        case "$STALE_CHOICE" in
+            keep)
+                if findmnt -rno TARGET 2>/dev/null | grep -qE '^/mnt(/|$)'; then
+                    log "  [dry-run] A real run would first unmount what is mounted under /mnt; this one leaves it."
+                fi
+                log "  [dry-run] Keeping ${LUKS_NAME} open — it is read as it stands."
+                ;;
+            close)
+                log "[dry-run] Would unmount anything under /mnt, then close /dev/mapper/${LUKS_NAME}."
+                log "[dry-run] Nothing was changed."
+                exit 0
+                ;;
+            *)
+                fatal "Answer 'keep' or 'close'. Nothing was changed."
+                ;;
+        esac
+    else
+        umount -R /mnt 2>/dev/null || true
+        case "$STALE_CHOICE" in
+            keep)
+                log "  Keeping ${LUKS_NAME} open — it will be reused."
+                ;;
+            close)
+                cryptsetup close ${LUKS_NAME} 2>/dev/null \
+                    || fatal "Could not close ${LUKS_NAME} (still in use?). Close it manually and re-run."
+                log "  Closed stale ${LUKS_NAME}."
+                ;;
+            *)
+                fatal "Answer 'keep' or 'close'. Nothing was changed."
+                ;;
+        esac
+    fi
 fi
 
 # ─── Dependency Check (live environment core) ────────────────────────────────
@@ -1218,6 +1305,12 @@ if [ -b /dev/mapper/${LUKS_NAME} ]; then
     else
         err "/dev/mapper/${LUKS_NAME} is open but backed by: $MAPPER_BACKING"
         err "You selected ROOT: $TARGET_ROOT_REAL"
+        if [ "$DRY_RUN" = "1" ]; then
+            err "Reusing this mapper would configure the WRONG system — a real run closes it here."
+            log "[dry-run] Would close /dev/mapper/${LUKS_NAME}, then go on with $TARGET_ROOT."
+            log "[dry-run] Nothing was changed."
+            exit 0
+        fi
         err "Reusing this mapper would configure the WRONG system — closing it."
         if cryptsetup close ${LUKS_NAME} 2>/dev/null; then
             log "  Closed mismatched ${LUKS_NAME}; the selected device will be opened when needed."
@@ -1616,6 +1709,16 @@ if blkid "$TARGET_ROOT" | grep -q 'TYPE="crypto_LUKS"'; then
         echo "  (reencrypt --resume-only) and then redo the configuration"
         echo "  phase. This script can do both now."
         echo ""
+        # Finishing it writes the whole device, and everything after it reads
+        # the finished volume, so a dry run stops here — whatever LUKS_RESUME
+        # says. Not even the passphrase is asked for.
+        if [ "$DRY_RUN" = "1" ]; then
+            log "[dry-run] Would finish the interrupted encryption: cryptsetup reencrypt --resume-only $TARGET_ROOT"
+            log "[dry-run] (cryptsetup repair first, if a hard interruption left its journal dirty), then redo"
+            log "[dry-run] the configuration phase. The rest of the plan reads the finished volume, so the"
+            log "[dry-run] dry run stops here. Nothing was changed."
+            exit 0
+        fi
         ask RESUME_OK LUKS_RESUME "  Resume the interrupted encryption now? (yes/no): "
         [ "$RESUME_OK" = "yes" ] \
             || fatal "Aborted. Resume manually with: cryptsetup reencrypt --resume-only $TARGET_ROOT"
@@ -1652,6 +1755,13 @@ if blkid "$TARGET_ROOT" | grep -q 'TYPE="crypto_LUKS"'; then
             ask LUKS2_CHOICE LUKS_EXISTING "  Select [1-3, default 3=quit]: "
             case "${LUKS2_CHOICE:-3}" in
                 1|tune)
+                    if [ "$DRY_RUN" = "1" ]; then
+                        log "[dry-run] Would start luks-tune.sh to re-cost the keyslots of $TARGET_ROOT."
+                        log "[dry-run] It has a dry run of its own, which shows the exact command and changes"
+                        log "[dry-run] nothing: $SCRIPT_DIR/luks-tune.sh --dry-run"
+                        log "[dry-run] Nothing was changed."
+                        exit 0
+                    fi
                     log "Launching the KDF tuning UI..."
                     [ -x "$SCRIPT_DIR/luks-tune.sh" ] \
                         || fatal "luks-tune.sh not found next to this script."
@@ -1706,6 +1816,7 @@ if [ "$DEPLOY_MODE" = "config-only" ]; then
     if [ ! -b /dev/mapper/${LUKS_NAME} ]; then
         log "Unlocking $TARGET_ROOT (passphrase required)..."
         cryptsetup open "${CRYPT_PASS_ARGS[@]}" "$TARGET_ROOT" ${LUKS_NAME}
+        MAPPER_OPENED_HERE=1
     fi
     DISCOVERY_DEV="/dev/mapper/${LUKS_NAME}"
 fi
@@ -1881,7 +1992,15 @@ fi
 echo ""
 log "Auto-discovering the target system's configuration..."
 
+# A dry run mounts at /mnt_temp only over nothing. A mount an earlier run left
+# there is not its to touch: unmounting a read-write filesystem writes to it.
+if [ "$DRY_RUN" = "1" ] && findmnt -rno TARGET 2>/dev/null | grep -qE '^/mnt_temp(/|$)'; then
+    log "[dry-run] /mnt_temp is still mounted from an earlier run, and a dry run mounts nothing over"
+    log "[dry-run] it. Unmount it, or run without --dry-run. Nothing was changed."
+    exit 0
+fi
 mkdir -p /mnt_temp
+MNT_TEMP_MOUNTED_HERE=1
 
 ROOT_SUBVOL=""
 HOME_SUBVOL=""
@@ -1889,7 +2008,7 @@ SUBPATH=""            # path prefix of the root subvolume inside /mnt_temp
 if [ "$IS_BTRFS" -eq 1 ]; then
     # Mount top-level subvolume (ID 5) to see all subvolume directories
     # (through the opened mapper in config-only mode, raw partition otherwise)
-    mount -o subvolid=5,ro "$DISCOVERY_DEV" /mnt_temp
+    ll_ro_mount "$DISCOVERY_DEV" /mnt_temp subvolid=5
     for try_sub in root @rootfs @ ""; do
         if [ -f "/mnt_temp/${try_sub}${try_sub:+/}etc/fstab" ]; then
             ROOT_SUBVOL="$try_sub"
@@ -1898,7 +2017,7 @@ if [ "$IS_BTRFS" -eq 1 ]; then
         fi
     done
 else
-    mount -o ro "$DISCOVERY_DEV" /mnt_temp
+    ll_ro_mount "$DISCOVERY_DEV" /mnt_temp
     [ -f /mnt_temp/etc/fstab ] && SUBPATH=""
 fi
 
@@ -2185,7 +2304,7 @@ BLS_ROOT_SUBVOL=""
 if [ "$SYSTEM_MODE" -eq 1 ]; then
     BLS_SRC=""
     if [ "$BOOT_IS_SEPARATE" -eq 1 ]; then
-        if mount -o ro "$TARGET_BOOT" "/mnt_temp/${SUBPATH}boot" 2>/dev/null; then
+        if ll_ro_mount "$TARGET_BOOT" "/mnt_temp/${SUBPATH}boot" 2>/dev/null; then
             BLS_SRC="/mnt_temp/${SUBPATH}boot"
         fi
     else

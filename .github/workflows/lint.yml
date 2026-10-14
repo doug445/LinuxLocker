@@ -10,13 +10,13 @@ permissions:
 # 2026-10-19, which would change shellcheck and the test environment under
 # the x86 legs while the arm legs stayed on 24.04. A gate has to mean the same
 # thing on every run, and the two legs of a matrix must differ only by
-# architecture. actions/checkout@v5 runs on Node 24.
+# architecture. actions/checkout@v7 runs on Node 24.
 
 jobs:
   shellcheck:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: bash syntax check (bash -n)
         run: |
@@ -45,7 +45,7 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: install cryptsetup + btrfs-progs + gdisk + dosfstools
         run: |
           sudo apt-get update -q
@@ -62,7 +62,7 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: install binutils (objcopy, for .cmdline extraction)
         run: sudo apt-get update -q && sudo apt-get install -y -q binutils
       - name: UKI fixture test
@@ -78,6 +78,6 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: command-line carrier fixture test
         run: bash tests/cmdline-fixture-test.sh

@@ -109,10 +109,14 @@ uki_scan_dir() {
 # uki_probe_dev <device> <label> — mount a block device read-only and scan it.
 # Used during discovery, when /boot and the ESP are still just partitions.
 uki_probe_dev() {
-    local dev="$1" label="$2" probe
+    local dev="$1" label="$2" probe mnt=(mount -o ro)
     [ -n "$dev" ] && [ -b "$dev" ] || return 0
+    # The caller's read-only mount is used when it has one: luks-deploy.sh's
+    # ll_ro_mount also replays no journal during a dry run, where a plain "ro"
+    # mount of a dirty /boot would write the replay to the target.
+    declare -F ll_ro_mount >/dev/null 2>&1 && mnt=(ll_ro_mount)
     probe=$(mktemp -d /tmp/luks-uki-probe.XXXXXX) || return 0
-    if mount -o ro "$dev" "$probe" 2>/dev/null; then
+    if "${mnt[@]}" "$dev" "$probe" 2>/dev/null; then
         uki_scan_dir "$probe" "$label"
         umount "$probe" 2>/dev/null || true
     fi

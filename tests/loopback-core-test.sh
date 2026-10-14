@@ -49,6 +49,13 @@
 #      uses for every ext2/3/4 target
 #   8. LUKS1 → LUKS2 conversion + argon2id keyslot re-costing (the
 #      convert_luks1 sequence) on a LUKS1-formatted volume, AF hash pinned
+#  11. a GPT image laid out like an Apple Silicon disk: the partition check
+#      flags its LUKS root signal by signal without writing a byte, and the
+#      real luks-deploy.sh refuses it before converting, resuming or tuning
+#  12. --dry-run writes nothing: the real luks-deploy.sh, given LUKS_RESUME=yes
+#      and a passphrase file, does not resume an interrupted encryption; does
+#      not start luks-tune.sh; and leaves a mapper an earlier run left open,
+#      and its filesystem mounted at /mnt, as they were
 #
 # Run as root:  sudo bash tests/loopback-core-test.sh
 # Requires: cryptsetup >= 2.4, btrfs-progs, e2fsprogs, util-linux (losetup).
@@ -515,6 +522,7 @@ else
                         env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$WORK" \
                         LUKS_TARGET_ROOT="${L11}p4" LUKS_LIVE_OVERRIDE=LIVE \
                         LUKS_BATTERY_OVERRIDE=BATTERY LUKS_EXISTING=quit \
+                        LUKS_MAPPER_NAME="lbt11-$$" \
                         bash ./luks-deploy.sh --dry-run </dev/null 2>&1) || rc=$?
                 h1=$(head -c 16M "${L11}p4" | sha256sum)
                 if [ "$rc" -eq 3 ] && grep -q 'The partition you selected belongs to an Apple Silicon' <<< "$out" \
@@ -538,6 +546,107 @@ else
             deploy_refuses "luks-deploy.sh refuses a finished LUKS2 root before the tune/config menu, header untouched"
         fi
     fi
+fi
+
+echo "== 12. --dry-run writes nothing: resume, the tune hand-off, a kept mapper, a mounted /mnt =="
+# A dry run prints what a step would do and stops before it, so it never
+# writes to the target — not even given LUKS_RESUME=yes and a passphrase
+# file, which until 1.6.6 finished an interrupted encryption for real. Every
+# case runs the real luks-deploy.sh with --dry-run, in a private mount
+# namespace, under its own mapper name, with the device hashed before and
+# after. The last three also leave a mapper open and its filesystem mounted
+# at /mnt, as an earlier run might, and check both are still there when the
+# dry run exits: unmounting a read-write filesystem writes to it, and the exit
+# cleanup used to unmount /mnt and close the mapper whoever had opened them.
+BIN="$(cd "$(dirname "$0")/../bin" && pwd)"
+if bash -c '. "$1"; ll_detect_asahi ""' _ "$BIN/lib-deps.sh"; then
+    echo "  SKIP: this machine is Asahi / Apple Silicon — luks-deploy.sh refuses it before any of this"
+elif ! command -v unshare >/dev/null; then
+    echo "  SKIP: no unshare(1) for a private mount namespace"
+else
+    MAP12="lbt12-$$"
+    mkdir -p "$WORK/kit"; cp "$BIN"/*.sh "$WORK/kit/"
+    TO12=(); command -v timeout >/dev/null && TO12=(timeout 300)
+    # A: a LUKS2 volume mid-encryption — the state an interrupted run leaves.
+    truncate -s 400M "$WORK/dry-resume.img"
+    L12A=$(losetup --show -f "$WORK/dry-resume.img"); LOOPS_EXTRA="${LOOPS_EXTRA:-} $L12A"
+    mk_shrunk_btrfs "$L12A"
+    cryptsetup reencrypt "${ENCRYPT_ARGS[@]}" --init-only "$L12A"
+    # B: a finished LUKS2 volume with an ext4 inside.
+    truncate -s 300M "$WORK/dry-luks2.img"
+    L12B=$(losetup --show -f "$WORK/dry-luks2.img"); LOOPS_EXTRA="${LOOPS_EXTRA:-} $L12B"
+    cryptsetup luksFormat --type luks2 "${KDF[@]}" --key-file "$WORK/pass" --batch-mode -q "$L12B"
+    cryptsetup open --key-file "$WORK/pass" "$L12B" "$MAP12"
+    mkfs.ext4 -q -F "/dev/mapper/$MAP12"
+    cryptsetup close "$MAP12"
+    udevadm settle 2>/dev/null || sleep 1
+    dry_run() {   # $1 = target, rest = pins -> OUT12, RC12; plain dry run, nothing left open
+        local target="$1"; shift
+        RC12=0
+        OUT12=$(cd "$WORK/kit" && "${TO12[@]}" unshare --mount --propagation private \
+                env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$WORK" \
+                LUKS_TARGET_ROOT="$target" LUKS_LIVE_OVERRIDE=LIVE LUKS_BATTERY_OVERRIDE=BATTERY \
+                LUKS_MAPPER_NAME="$MAP12" "$@" \
+                bash ./luks-deploy.sh --dry-run </dev/null 2>&1) || RC12=$?
+    }
+    dry_run_left_open() {   # $1 = target, rest = pins; MAP12 open on B and mounted at /mnt in the namespace
+        local target="$1"; shift
+        cryptsetup open --key-file "$WORK/pass" "$L12B" "$MAP12"
+        RC12=0
+        OUT12=$(cd "$WORK/kit" && "${TO12[@]}" unshare --mount --propagation private bash -c '
+                m="$1"; t="$2"; shift 2
+                mount -o ro "/dev/mapper/$m" /mnt || { echo "STATE: could not mount /mnt"; exit 90; }
+                env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp \
+                    LUKS_TARGET_ROOT="$t" LUKS_LIVE_OVERRIDE=LIVE LUKS_BATTERY_OVERRIDE=BATTERY \
+                    LUKS_MAPPER_NAME="$m" "$@" bash ./luks-deploy.sh --dry-run </dev/null 2>&1
+                rc=$?
+                if findmnt -rno TARGET -S "/dev/mapper/$m" | grep -qx /mnt; then
+                    echo "STATE: /mnt still mounted"
+                else
+                    echo "STATE: /mnt was UNMOUNTED"
+                fi
+                exit "$rc"' _ "$MAP12" "$target" "$@") || RC12=$?
+        if [ -b "/dev/mapper/$MAP12" ]; then OUT12="$OUT12
+STATE: mapper still open"; else OUT12="$OUT12
+STATE: mapper was CLOSED"; fi
+        cryptsetup close "$MAP12" 2>/dev/null || true
+    }
+    verdict12() {   # $1 = label, $2 = device, $3 = hash before, $4 = ERE the run must print, $5 = 1 to check /mnt and the mapper
+        local h1 why=""
+        h1=$(sha256sum < "$2")
+        [ "$RC12" -eq 0 ] || why="exit $RC12"
+        grep -qE "$4" <<< "$OUT12" || why="${why:+$why, }no /$4/"
+        [ "$3" = "$h1" ] || why="${why:+$why, }$2 CHANGED"
+        if [ "${5:-0}" = 1 ]; then
+            grep -q 'STATE: /mnt still mounted' <<< "$OUT12" || why="${why:+$why, }/mnt not left as it was"
+            grep -q 'STATE: mapper still open' <<< "$OUT12" || why="${why:+$why, }the mapper was closed"
+        fi
+        if [ -z "$why" ]; then pass "$1"
+        else fail "$1: $why: $(grep -v '^STATE:' <<< "$OUT12" | tail -n 3 | tr '\n' ' ')"; fi
+    }
+    H=$(sha256sum < "$L12A")
+    dry_run "$L12A" LUKS_RESUME=yes LUKS_PASSPHRASE_FILE="$WORK/pass"
+    verdict12 "mid-encryption, LUKS_RESUME=yes and a passphrase file: not resumed, every byte of the device unchanged" \
+        "$L12A" "$H" '\[dry-run\] Would finish the interrupted encryption'
+    has_reenc_flag "$L12A" \
+        && pass "the online-reencrypt flag is still there for a real run to finish" \
+        || fail "the online-reencrypt flag is gone: the dry run resumed the encryption"
+    H=$(sha256sum < "$L12B")
+    dry_run "$L12B" LUKS_EXISTING=tune
+    verdict12 "finished LUKS2 with LUKS_EXISTING=tune: luks-tune.sh not started, device unchanged" \
+        "$L12B" "$H" '\[dry-run\] Would start luks-tune.sh'
+    H=$(sha256sum < "$L12A")
+    dry_run_left_open "$L12A" LUKS_STALE_MAPPER=keep
+    verdict12 "a mapper left open (kept) on another device: stops before closing it; /mnt and the mapper untouched" \
+        "$L12A" "$H" '\[dry-run\] Would close /dev/mapper/' 1
+    H=$(sha256sum < "$L12A")
+    dry_run_left_open "$L12A" LUKS_STALE_MAPPER=close
+    verdict12 "a mapper left open, LUKS_STALE_MAPPER=close: stops before unmounting or closing; both untouched" \
+        "$L12A" "$H" '\[dry-run\] Would unmount anything under /mnt, then close' 1
+    H=$(sha256sum < "$L12B")
+    dry_run_left_open "$L12B" LUKS_STALE_MAPPER=keep LUKS_EXISTING=config
+    verdict12 "config-only through the kept mapper: read without replaying a journal, /mnt and the mapper left as they were" \
+        "$L12B" "$H" 'nothing to do on a data partition' 1
 fi
 
 echo ""
