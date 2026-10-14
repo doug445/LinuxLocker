@@ -779,20 +779,92 @@ fs_bytes() {
     esac
 }
 
-# fs_check_ro <dev> <fstype> — read-only integrity check. Returns the checker's
-# exit status; returns 2 (distinct "cannot check") when no checker exists.
+# fs_check_ro <dev> <fstype> — the optional pre-encryption check, read-only for
+# every filesystem: e2fsck -f -n, btrfs check --readonly, xfs_repair -n,
+# fsck.f2fs --dry-run, ntfsfix --no-action, fsck.fat -n — each writes nothing,
+# clean or damaged. Each runs with stdin from /dev/null, so none can put a fix
+# question to you (fsck.f2fs asks one on damaged metadata; answered, it can
+# crash). Returns the checker's status: 0 clean, anything else errors found.
+#
+# Nothing here repairs, and nothing falls back to a mode that does — until
+# 1.6.7 a refused or failed fsck.f2fs --dry-run went on to fsck.f2fs -a, a
+# repairing mode that also turned "errors found" into a pass, and ntfsfix's
+# refusal was overruled by ntfsresize --info. Where this machine has no
+# read-only checker for <fstype> (a fsck.f2fs without --dry-run, an ntfsfix
+# without --no-action, a missing tool), FS_CHECK_SKIP says why and it returns
+# 0 having checked nothing; integrity_check reports that as a skip.
+FS_CHECK_SKIP=""
 fs_check_ro() {
-    local dev="$1" fstype="$2"
+    local dev="$1" fstype="$2" usage
+    FS_CHECK_SKIP=""
     case "$fstype" in
-        ext2|ext3|ext4) e2fsck -f -n "$dev" ;;
-        btrfs)          btrfs check --readonly "$dev" 2>&1 | tail -3 ;;
-        xfs)            xfs_repair -n "$dev" ;;
-        ntfs)           ntfsfix --no-action "$dev" 2>&1 || ntfsresize --info --force "$dev" >/dev/null ;;
-        f2fs)           fsck.f2fs --dry-run "$dev" 2>&1 || fsck.f2fs -a "$dev" ;;
-        vfat)           fsck.fat -n "$dev" ;;
-        *)              return 2 ;;
+        ext2|ext3|ext4)
+            command -v e2fsck >/dev/null 2>&1 || { FS_CHECK_SKIP="e2fsck is not installed"; return 0; }
+            e2fsck -f -n "$dev" </dev/null ;;
+        btrfs)
+            command -v btrfs >/dev/null 2>&1 || { FS_CHECK_SKIP="btrfs-progs is not installed"; return 0; }
+            btrfs check --readonly "$dev" </dev/null 2>&1 | tail -3 ;;
+        xfs)
+            command -v xfs_repair >/dev/null 2>&1 || { FS_CHECK_SKIP="xfs_repair is not installed"; return 0; }
+            xfs_repair -n "$dev" </dev/null ;;
+        ntfs)
+            command -v ntfsfix >/dev/null 2>&1 || { FS_CHECK_SKIP="ntfsfix is not installed"; return 0; }
+            usage=$(ntfsfix --help </dev/null 2>&1 || true)
+            case "$usage" in
+                *--no-action*) ntfsfix --no-action "$dev" </dev/null 2>&1 ;;
+                *) FS_CHECK_SKIP="this ntfsfix has no --no-action mode, so it cannot check without writing"; return 0 ;;
+            esac ;;
+        f2fs)
+            command -v fsck.f2fs >/dev/null 2>&1 || { FS_CHECK_SKIP="fsck.f2fs is not installed"; return 0; }
+            # A bare fsck.f2fs prints its usage and touches no device.
+            usage=$(fsck.f2fs </dev/null 2>&1 || true)
+            case "$usage" in
+                *--dry-run*) fsck.f2fs --dry-run "$dev" </dev/null 2>&1 ;;
+                *) FS_CHECK_SKIP="this fsck.f2fs has no --dry-run mode, so it cannot check without repairing"; return 0 ;;
+            esac ;;
+        vfat)
+            command -v fsck.fat >/dev/null 2>&1 || { FS_CHECK_SKIP="fsck.fat is not installed"; return 0; }
+            fsck.fat -n "$dev" </dev/null ;;
+        *)
+            FS_CHECK_SKIP="there is no read-only checker for $fstype"; return 0 ;;
     esac
 }
+
+# --- integrity_check ---
+# integrity_check <dev> <fstype> — run fs_check_ro and act on what it found.
+# Clean: say so. No read-only checker here: say so, loudly, and go on without
+# a check — never a repairing fallback. Errors: report them, say what the
+# shrink that follows would do about them, and stop unless FORCE is typed.
+# Nothing in this step repairs anything.
+integrity_check() {
+    local dev="$1" fstype="$2" fsck_override=""
+    log "  Running read-only $fstype check (this may take a while)..."
+    if fs_check_ro "$dev" "$fstype"; then
+        if [ -n "$FS_CHECK_SKIP" ]; then
+            warn "  Filesystem check SKIPPED — $FS_CHECK_SKIP."
+            warn "  Nothing was checked, and nothing was repaired. If you can, check $dev"
+            warn "  with a read-only tool yourself before going on."
+        else
+            log "  Filesystem check: PASSED"
+        fi
+        return 0
+    fi
+    err "  Filesystem check found errors! Nothing was repaired."
+    if [ "${DEPLOY_MODE:-encrypt}" = "encrypt" ]; then
+        case "$fstype" in
+            ext2|ext3|ext4)
+                warn "  If you go on, the shrink before encryption (unless an earlier run already"
+                warn "  shrank it) runs e2fsck -f -p, then e2fsck -f -y: it repairs what it finds,"
+                warn "  answering yes to every fix." ;;
+            f2fs)
+                warn "  If you go on, the shrink before encryption (unless an earlier run already"
+                warn "  shrank it) runs fsck.f2fs -f, which repairs what it finds." ;;
+        esac
+    fi
+    ask fsck_override LUKS_FSCK_FORCE "  Continue despite filesystem errors? (Type 'FORCE' to override): "
+    [ "$fsck_override" = "FORCE" ] || fatal "Fix filesystem errors before encrypting."
+}
+# --- end integrity_check ---
 
 # fs_shrink <dev> <fstype> — shrink the filesystem by SHRINK_MB so the LUKS2
 # header fits. Fatal on failure (nothing has been encrypted yet; aborting is
@@ -2464,15 +2536,7 @@ else
 fi
 case "$DO_CHECK" in [Nn]|[Nn][Oo]) DO_CHECK=n ;; esac
 if [ "$DO_CHECK" != "n" ]; then
-    log "  Running read-only $ORIG_FSTYPE check (this may take a while)..."
-    if fs_check_ro "$CHECK_DEV" "$ORIG_FSTYPE"; then
-        log "  Filesystem check: PASSED"
-    else
-        err "  Filesystem check found errors!"
-        fsck_override=""
-        ask fsck_override LUKS_FSCK_FORCE "  Continue despite filesystem errors? (Type 'FORCE' to override): "
-        [ "$fsck_override" = "FORCE" ] || fatal "Fix filesystem errors before encrypting."
-    fi
+    integrity_check "$CHECK_DEV" "$ORIG_FSTYPE"
 else
     warn "  Skipping filesystem check."
 fi

@@ -9,15 +9,42 @@ Everything gnome-disks can format is classified below.
 
 | Filesystem | In place? | Shrink tool | Size probe (idempotency guard) | Notes |
 |---|---|---|---|---|
-| ext4 / ext3 / ext2 | ✅ | `resize2fs` (offline, after forced `e2fsck`) | `dumpe2fs` block count × block size | grow-back via `resize2fs` with no size argument |
+| ext4 / ext3 / ext2 | ✅ | `resize2fs` (offline, after a repairing `e2fsck -f -p`, then `-y`) | `dumpe2fs` block count × block size | grow-back via `resize2fs` with no size argument |
 | btrfs | ✅ | `btrfs filesystem resize -32M` (mounted) | `dump-super total_bytes` | subvolume layouts (`root`, `@`, `@rootfs`, flat) auto-detected; grow via `resize max` |
 | xfs | ⚠️ slack only | **none — XFS cannot shrink** | `xfs_db` dblocks × blocksize | accepted only when ≥ 32 MiB of slack already exists between filesystem end and partition end; grow via `xfs_growfs` |
-| f2fs | ✅ | `resize.f2fs -t` (needs f2fs-tools ≥ 1.16) | none — the script asks on re-runs whether a previous shrink completed | common on SBC/flash installs |
+| f2fs | ✅ | `resize.f2fs -t` (needs f2fs-tools ≥ 1.16), after a repairing `fsck.f2fs -f` | none — the script asks on re-runs whether a previous shrink completed | common on SBC/flash installs |
 | ntfs | ✅ | `ntfsresize --size` | `ntfsresize --info` | data partitions; the resize marks the volume for a consistency check on the next Windows boot (normal) |
 | vfat | ✅ | `fatresize` | none — asks on re-runs | data partitions / firmware copies |
 | exfat | ❌ | no shrink tool exists | — | back up → `mkfs.exfat` on a LUKS container → restore |
 | udf | ❌ | no shrink tool exists | — | same workaround as exfat |
 | swap | ❌ (by design) | — | — | swap holds no data worth an in-place conversion; see below |
+
+## The integrity check
+
+Before anything is changed, a real run offers to check the target
+filesystem (`LUKS_FSCK=yes|no`; a dry run skips it). The check is read-only
+for every filesystem: no checker runs in a mode that can repair, and none is
+handed your keyboard — stdin is closed, so no fix question can be answered.
+
+| Filesystem | Check |
+|---|---|
+| ext4 / ext3 / ext2 | `e2fsck -f -n` |
+| btrfs | `btrfs check --readonly` |
+| xfs | `xfs_repair -n` |
+| f2fs | `fsck.f2fs --dry-run` |
+| ntfs | `ntfsfix --no-action` |
+| vfat | `fsck.fat -n` |
+
+- **Errors** are reported and nothing is repaired; the run stops unless you
+  type `FORCE` (`LUKS_FSCK_FORCE=FORCE`). If you go on, know that the shrink
+  that follows runs a repairing check of its own, because its tools need a
+  consistent filesystem — ext2/3/4 `e2fsck -f -p` and then `e2fsck -f -y`,
+  f2fs `fsck.f2fs -f` — unless an earlier run already shrank it. Both repair
+  what they find; the `FORCE` prompt says so.
+- **No read-only checker on this machine** — a `fsck.f2fs` without
+  `--dry-run`, an `ntfsfix` without `--no-action`, a missing tool — and the
+  check is skipped with a warning that says why. It never falls back to a
+  repairing mode, as f2fs's did until 1.6.7 (`fsck.f2fs -a`).
 
 ## System vs data partitions
 

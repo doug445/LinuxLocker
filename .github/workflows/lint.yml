@@ -63,8 +63,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - name: install binutils (objcopy, for .cmdline extraction)
-        run: sudo apt-get update -q && sudo apt-get install -y -q binutils
+      # binutils: objcopy, for .cmdline extraction. The filesystem tools: the
+      # integrity check runs against real checkers on small image files.
+      - name: install binutils + filesystem tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q binutils e2fsprogs f2fs-tools ntfs-3g dosfstools btrfs-progs xfsprogs
       - name: UKI fixture test
         run: bash tests/uki-fixture-test.sh
 

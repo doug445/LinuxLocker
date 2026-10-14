@@ -42,6 +42,11 @@
 #       the read-only probe options — its copies in luks-deploy.sh and
 #       luks-tune.sh, the line order that puts it before every action on the
 #       selected partition, and this machine's own disks when one is Apple's
+#   10. the integrity check offered before encryption is read-only for every
+#       filesystem: no repairing call even when a checker lacks its read-only
+#       mode (a skip instead), no stdin for a fix question, errors to the
+#       FORCE gate — against fake checkers, and against the real ones on
+#       small image files, which must come back byte-identical
 #
 # Run:  bash tests/uki-fixture-test.sh        (no root, no disk, no network)
 # ============================================================================
@@ -937,6 +942,248 @@ else
         *"umount /mnt;"*"cryptsetup close root_crypt;"*"rm -f /mnt/tmp/.luks-deploy-env"*) pass "a real run's cleanup is unchanged: chroot mounts, /mnt, the mapper, the chroot scripts" ;;
         *) fail "a real run's cleanup changed: $GOT" ;;
     esac
+fi
+
+# ─── 12. The integrity check is read-only for every filesystem ──────────────
+# Before encryption the script offers a "read-only integrity check". Until
+# 1.6.7, f2fs's was fsck.f2fs --dry-run || fsck.f2fs -a: a fsck.f2fs that
+# refused --dry-run, or found errors, went on to -a — a repairing mode, which
+# also exits 0 and so turned "errors found" into PASSED. ntfs's was
+# ntfsfix --no-action || ntfsresize --info, so ntfsresize overruled ntfsfix.
+# Three ways in:
+#   a. fs_check_ro (cut out by its function boundaries, so 1.6.6's runs too)
+#      against fake tools that record every call, and whether stdin reached
+#      them: a fsck.f2fs without --dry-run must lead to no repair call at all,
+#      only a skip; no checker may run anything but its read-only mode, or be
+#      handed a "y" from stdin
+#   b. integrity_check — skip, pass, errors → the FORCE gate, and the warning
+#      about what the shrink would repair — with fs_check_ro stubbed
+#   c. fs_check_ro against the real tools, on small image files (no root):
+#      every image byte-identical afterwards, and its verdict the read-only
+#      checker's own — damaged images included
+echo ""
+echo "[12] The integrity check is read-only for every filesystem"
+D="$REPO/bin/luks-deploy.sh"
+FSCK_FN=$(sed -n '/^fs_check_ro() {/,/^}/p' "$D")
+FK="$TMP/fsck"; mkdir -p "$FK"
+cat > "$FK/fakes.sh" <<'FAKES'
+# Fake checkers: each records its arguments and whether stdin reached it.
+fk_in() { local _l; if IFS= read -r -t 1 _l; then echo fed; else echo eof; fi; }
+fsck.f2fs() {
+    local s; s=$(fk_in); echo "fsck.f2fs $* [stdin:$s]" >> "$FK_LOG"
+    if [ "$#" -eq 0 ]; then
+        echo "Usage: fsck.f2fs [options] device"
+        echo "  -a check/fix potential corruption, reported by f2fs"
+        [ "$FK_F2FS" = new ] && echo "  --dry-run do not really fix corruptions"
+        return 1
+    fi
+    case " $* " in
+        *" --dry-run "*) [ "$FK_F2FS" = new ] || { echo "Error: Unknown option"; return 1; }; return "$FK_RC" ;;
+        *" -a "*|*" -f "*|*" -p "*|*" -y "*) echo "REPAIR fsck.f2fs $*" >> "$FK_LOG"; return 0 ;;
+    esac
+    return 0
+}
+ntfsfix() {
+    local s; s=$(fk_in); echo "ntfsfix $* [stdin:$s]" >> "$FK_LOG"
+    case " $* " in
+        " --help ") echo "Usage: ntfsfix [options] device"
+                    [ "$FK_NTFS" = new ] && echo "    -n, --no-action         Do not write anything"
+                    return 0 ;;
+        *" --no-action "*) [ "$FK_NTFS" = new ] || return 1; return "$FK_RC" ;;
+    esac
+    echo "WRITE ntfsfix $*" >> "$FK_LOG"; return 0
+}
+ntfsresize() { local s; s=$(fk_in); echo "ntfsresize $* [stdin:$s]" >> "$FK_LOG"; return 0; }
+e2fsck() {
+    local s; s=$(fk_in); echo "e2fsck $* [stdin:$s]" >> "$FK_LOG"
+    case " $* " in *" -n "*) ;; *) echo "REPAIR e2fsck $*" >> "$FK_LOG" ;; esac
+    return "$FK_RC"
+}
+xfs_repair() {
+    local s; s=$(fk_in); echo "xfs_repair $* [stdin:$s]" >> "$FK_LOG"
+    case " $* " in *" -n "*) ;; *) echo "REPAIR xfs_repair $*" >> "$FK_LOG" ;; esac
+    return "$FK_RC"
+}
+btrfs() {
+    local s; s=$(fk_in); echo "btrfs $* [stdin:$s]" >> "$FK_LOG"
+    case " $* " in *" --repair "*) echo "REPAIR btrfs $*" >> "$FK_LOG" ;; esac
+    echo "checking extents"; echo "found 0 bytes used"
+    return "$FK_RC"
+}
+fsck.fat() {
+    local s; s=$(fk_in); echo "fsck.fat $* [stdin:$s]" >> "$FK_LOG"
+    case " $* " in *" -n "*) ;; *) echo "REPAIR fsck.fat $*" >> "$FK_LOG" ;; esac
+    return "$FK_RC"
+}
+FAKES
+fsck_case() {   # $1 fstype, $2 rc the checker returns, $3 f2fs fake new|old, $4 ntfs fake new|old -> "rc|skip|calls"
+    : > "$FK/log"
+    env -u BASH_ENV FK_LOG="$FK/log" FK_RC="$2" FK_F2FS="$3" FK_NTFS="$4" bash -c '
+        set -uo pipefail; FS_CHECK_SKIP=""
+        . "$1"; eval "$2"
+        fs_check_ro /dev/fixture "$3" >/dev/null 2>&1; rc=$?
+        printf "%s|%s|" "$rc" "$FS_CHECK_SKIP"; paste -sd";" "$FK_LOG"' _ "$FK/fakes.sh" "$FSCK_FN" "$1" \
+        < <(yes y | head -n 50)
+}
+if [ -z "$FSCK_FN" ]; then
+    fail "luks-deploy.sh has no fs_check_ro function"
+else
+    GOT=$(fsck_case f2fs 0 old new)
+    case "$GOT" in
+        *REPAIR*)                  fail "a fsck.f2fs without --dry-run led to a repairing call: $GOT" ;;
+        "0|"*"no --dry-run"*)      [[ "$GOT" == *"/dev/fixture"* ]] \
+                                       && fail "a fsck.f2fs without --dry-run was still run on the device: $GOT" \
+                                       || pass "a fsck.f2fs without --dry-run: skipped, and no -a or any other call on the device" ;;
+        *)                         fail "a fsck.f2fs without --dry-run was not reported as a skip: $GOT" ;;
+    esac
+    for c in "f2fs|0|new|new|fsck.f2fs --dry-run /dev/fixture" \
+             "f2fs|4|new|new|fsck.f2fs --dry-run /dev/fixture" \
+             "ntfs|0|new|new|ntfsfix --no-action /dev/fixture" \
+             "ntfs|1|new|new|ntfsfix --no-action /dev/fixture" \
+             "ext4|0|new|new|e2fsck -f -n /dev/fixture" \
+             "ext4|4|new|new|e2fsck -f -n /dev/fixture" \
+             "xfs|2|new|new|xfs_repair -n /dev/fixture" \
+             "btrfs|1|new|new|btrfs check --readonly /dev/fixture" \
+             "vfat|1|new|new|fsck.fat -n /dev/fixture"; do
+        IFS='|' read -r fs rc f2 nt want <<< "$c"
+        GOT=$(fsck_case "$fs" "$rc" "$f2" "$nt")
+        IFS='|' read -r grc gskip gcalls <<< "$GOT"
+        why=""
+        [ "$grc" = "$rc" ] || why="returned $grc, the checker said $rc"
+        [ -z "$gskip" ] || why="${why:+$why; }skipped: $gskip"
+        [[ "$gcalls" == *"$want [stdin:eof]"* ]] || why="${why:+$why; }never ran '$want' with stdin closed"
+        [[ "$gcalls" == *REPAIR* || "$gcalls" == *WRITE* ]] && why="${why:+$why; }called a repairing mode"
+        [[ "$gcalls" == *"[stdin:fed]"* ]] && why="${why:+$why; }handed stdin to a checker"
+        [[ "$gcalls" == *ntfsresize* ]] && why="${why:+$why; }let ntfsresize decide"
+        if [ -z "$why" ]; then pass "$fs, checker exits $rc: '$want' alone, read-only, verdict passed through"
+        else fail "$fs, checker exits $rc: $why — calls: $gcalls"; fi
+    done
+    GOT=$(fsck_case ntfs 0 new old)
+    case "$GOT" in
+        "0|"*"no --no-action"*) [[ "$GOT" == *"/dev/fixture"* ]] \
+                                    && fail "an ntfsfix without --no-action was still run on the device: $GOT" \
+                                    || pass "an ntfsfix without --no-action: skipped, nothing run on the device" ;;
+        *) fail "an ntfsfix without --no-action was not reported as a skip: $GOT" ;;
+    esac
+    GOT=$(fsck_case exfat 0 new new)
+    case "$GOT" in
+        "0|"*"no read-only checker for exfat"*) pass "a filesystem with no read-only checker is a skip, not an error" ;;
+        *) fail "an unknown filesystem was not reported as a skip: $GOT" ;;
+    esac
+fi
+IC_FN=$(sed -n '/^# --- integrity_check ---$/,/^# --- end integrity_check ---$/p' "$D")
+if [ -z "$IC_FN" ]; then
+    fail "luks-deploy.sh has no '# --- integrity_check ---' block"
+else
+    ic_case() {   # $1 stub rc, $2 stub skip, $3 fstype, $4 DEPLOY_MODE, $5 LUKS_FSCK_FORCE -> what integrity_check said, and its exit
+        env -u BASH_ENV STUB_RC="$1" STUB_SKIP="$2" DEPLOY_MODE="$4" LUKS_FSCK_FORCE="$5" bash -c '
+            set -uo pipefail; FS_CHECK_SKIP=""
+            log()   { echo "LOG $*"; }
+            warn()  { echo "WARN $*"; }
+            err()   { echo "ERR $*"; }
+            fatal() { echo "FATAL $*"; exit 1; }
+            ask()   { echo "ASK $3"; printf -v "$1" "%s" "${!2:-}"; }
+            eval "$1"
+            fs_check_ro() { FS_CHECK_SKIP="$STUB_SKIP"; return "$STUB_RC"; }
+            integrity_check /dev/fixture "$2"; echo "EXIT $?"' _ "$IC_FN" "$3" 2>&1 | paste -sd'~'
+    }
+    GOT=$(ic_case 0 "this fsck.f2fs has no --dry-run mode, so it cannot check without repairing" f2fs encrypt "")
+    case "$GOT" in
+        *ASK*|*FATAL*) fail "a skipped check went to the FORCE gate: $GOT" ;;
+        *"WARN   Filesystem check SKIPPED — this fsck.f2fs has no --dry-run mode"*"EXIT 0") pass "no read-only checker: a loud skip, no FORCE gate, nothing repaired" ;;
+        *) fail "a skipped check was not reported as one: $GOT" ;;
+    esac
+    GOT=$(ic_case 0 "" ext4 encrypt "")
+    case "$GOT" in *"LOG   Filesystem check: PASSED~EXIT 0") pass "a clean check passes" ;; *) fail "a clean check: $GOT" ;; esac
+    GOT=$(ic_case 4 "" ext4 encrypt "")
+    case "$GOT" in
+        *"Nothing was repaired."*"e2fsck -f -p, then e2fsck -f -y"*"ASK"*"FATAL Fix filesystem errors before encrypting."*)
+            pass "ext4 errors: reported, the shrink's e2fsck -p/-y named, FORCE asked, stopped without it" ;;
+        *) fail "ext4 errors were not routed to the FORCE gate: $GOT" ;;
+    esac
+    GOT=$(ic_case 4 "" f2fs encrypt FORCE)
+    case "$GOT" in
+        *FATAL*) fail "f2fs errors with FORCE still stopped: $GOT" ;;
+        *"Nothing was repaired."*"fsck.f2fs -f, which"*"ASK"*"EXIT 0") pass "f2fs errors: the shrink's fsck.f2fs -f named, FORCE lets the run go on" ;;
+        *) fail "f2fs errors with FORCE: $GOT" ;;
+    esac
+    GOT=$(ic_case 4 "" ext4 config-only FORCE)
+    case "$GOT" in
+        *"e2fsck -f -p"*) fail "config-only (no shrink) still warned about the shrink's repairs: $GOT" ;;
+        *"ASK"*"EXIT 0") pass "config-only: errors reach the FORCE gate, with no shrink to warn about" ;;
+        *) fail "config-only errors: $GOT" ;;
+    esac
+fi
+# c. The real tools, on image files. Each damaged image is made the same way
+#    every time; whatever this machine's version of the checker makes of it,
+#    fs_check_ro must say the same, and leave the image as it was.
+real_case() {   # $1 label, $2 image, $3 fstype, $4 the checker's own read-only verdict command,
+                # $5 the command that prints its usage, $6 the read-only option that usage must name
+    local h0 h1 want got usage
+    h0=$(sha256sum < "$2")
+    want=0; timeout 60 bash -c "$4" _ "$2" </dev/null >/dev/null 2>&1 || want=$?
+    got=$(env -u BASH_ENV timeout 60 bash -c 'set -uo pipefail; FS_CHECK_SKIP=""; eval "$1"
+              fs_check_ro "$2" "$3" >/dev/null 2>&1; echo "$?|$FS_CHECK_SKIP"' _ "$FSCK_FN" "$2" "$3" \
+              < <(yes y | head -n 100) 2>/dev/null) || got="timeout"
+    h1=$(sha256sum < "$2")
+    usage=""; [ -n "${5:-}" ] && usage=$(bash -c "$5" </dev/null 2>&1 || true)
+    if [ "$h0" != "$h1" ]; then fail "$1: the check CHANGED the image"
+    elif [ "${got%%|*}" = "$want" ] && [ -z "${got#*|}" ]; then pass "$1: verdict $want, the checker's own; image unchanged"
+    elif [ "${got%%|*}" = 0 ] && [ -n "${got#*|}" ] && [ -n "${6:-}" ] && [[ "$usage" != *"$6"* ]]; then
+        pass "$1: skipped, rightly — this version's usage names no $6; image unchanged"
+    else fail "$1: the checker says $want, fs_check_ro said '${got}'"; fi
+}
+fill() { head -c "$(( $2 * $3 ))" /dev/zero | tr '\0' '\377' | dd of="$1" bs="$2" seek="$4" conv=notrunc status=none; }
+RI="$TMP/real"; mkdir -p "$RI"
+if [ -z "$FSCK_FN" ]; then
+    :
+else
+    if command -v mkfs.f2fs >/dev/null 2>&1 && command -v fsck.f2fs >/dev/null 2>&1; then
+        for n in clean meta ask; do truncate -s 128M "$RI/f2fs-$n.img"; mkfs.f2fs -q "$RI/f2fs-$n.img" >/dev/null 2>&1; done
+        fill "$RI/f2fs-meta.img" 4096 1024 1024     # the checkpoint/SIT area: --dry-run reports errors
+        fill "$RI/f2fs-ask.img" 4096 2048 2048      # further in: fsck.f2fs also asks a [Y/N] question
+        real_case "f2fs, clean" "$RI/f2fs-clean.img" f2fs 'fsck.f2fs --dry-run "$1"' fsck.f2fs --dry-run
+        real_case "f2fs, damaged metadata" "$RI/f2fs-meta.img" f2fs 'fsck.f2fs --dry-run "$1"' fsck.f2fs --dry-run
+        real_case "f2fs, damaged so that fsck.f2fs asks — fed 'y' on stdin" "$RI/f2fs-ask.img" f2fs 'fsck.f2fs --dry-run "$1"' fsck.f2fs --dry-run
+    else
+        skip "f2fs-tools not installed — the real-tool f2fs cases"
+    fi
+    if command -v mkfs.ext4 >/dev/null 2>&1 && command -v e2fsck >/dev/null 2>&1; then
+        for n in clean bad; do truncate -s 64M "$RI/ext4-$n.img"; mkfs.ext4 -q -F "$RI/ext4-$n.img"; done
+        fill "$RI/ext4-bad.img" 4096 8 1            # the group descriptors
+        real_case "ext4, clean" "$RI/ext4-clean.img" ext4 'e2fsck -f -n "$1"'
+        real_case "ext4, damaged group descriptors" "$RI/ext4-bad.img" ext4 'e2fsck -f -n "$1"'
+    else
+        skip "e2fsprogs not installed — the real-tool ext4 cases"
+    fi
+    if command -v mkfs.fat >/dev/null 2>&1 && command -v fsck.fat >/dev/null 2>&1; then
+        for n in clean bad; do truncate -s 64M "$RI/vfat-$n.img"; mkfs.fat -F 32 "$RI/vfat-$n.img" >/dev/null 2>&1; done
+        fill "$RI/vfat-bad.img" 512 64 32           # the first FAT
+        real_case "vfat, clean" "$RI/vfat-clean.img" vfat 'fsck.fat -n "$1"'
+        real_case "vfat, damaged FAT" "$RI/vfat-bad.img" vfat 'fsck.fat -n "$1"'
+    else
+        skip "dosfstools not installed — the real-tool vfat cases"
+    fi
+    if command -v mkntfs >/dev/null 2>&1 && command -v ntfsfix >/dev/null 2>&1; then
+        for n in clean bad; do truncate -s 64M "$RI/ntfs-$n.img"; mkntfs -q -F -f "$RI/ntfs-$n.img" >/dev/null 2>&1; done
+        dd if=/dev/zero of="$RI/ntfs-bad.img" bs=512 count=1 conv=notrunc status=none   # the boot sector
+        real_case "ntfs, clean" "$RI/ntfs-clean.img" ntfs 'ntfsfix --no-action "$1"' "ntfsfix --help" --no-action
+        real_case "ntfs, zeroed boot sector" "$RI/ntfs-bad.img" ntfs 'ntfsfix --no-action "$1"' "ntfsfix --help" --no-action
+    else
+        skip "ntfs-3g not installed — the real-tool ntfs cases"
+    fi
+    if command -v mkfs.btrfs >/dev/null 2>&1; then
+        truncate -s 300M "$RI/btrfs-clean.img"; mkfs.btrfs -q -f "$RI/btrfs-clean.img" >/dev/null 2>&1
+        real_case "btrfs, clean" "$RI/btrfs-clean.img" btrfs 'btrfs check --readonly "$1"'
+    else
+        skip "btrfs-progs not installed — the real-tool btrfs case"
+    fi
+    if command -v mkfs.xfs >/dev/null 2>&1; then
+        truncate -s 300M "$RI/xfs-clean.img"; mkfs.xfs -q -f "$RI/xfs-clean.img"
+        real_case "xfs, clean" "$RI/xfs-clean.img" xfs 'xfs_repair -n "$1"'
+    else
+        skip "xfsprogs not installed — the real-tool xfs case"
+    fi
 fi
 
 # ─── Result ──────────────────────────────────────────────────────────────────

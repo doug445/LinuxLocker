@@ -56,7 +56,10 @@ The deploy script then walks you through:
 - **Filesystem identification** — the filesystem's tools are auto-installed
   the moment the type is known (e.g. `e2fsprogs` for ext4, `ntfsprogs` for
   NTFS).
-- **Integrity check** — optional read-only fsck before anything changes.
+- **Integrity check** — optional, and read-only for every filesystem: errors
+  stop the run unless you type `FORCE`, and where this machine has no
+  read-only checker the check is skipped with a warning. Nothing is repaired
+  here; see [FILESYSTEMS.md](FILESYSTEMS.md#the-integrity-check).
 - **KDF profile** — aggressive / moderate / fast, with unlock-time estimates
   benchmarked on the machine in front of you.
 - **The `ENCRYPT` gate** — a typed confirmation. Immediately before
