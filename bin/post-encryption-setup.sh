@@ -60,6 +60,80 @@ warn(){ echo -e "  ${Y}[warn]${N} $*"; }
 err(){  echo -e "  ${RED}[fail]${N} $*"; }
 hdr(){  echo -e "\n${B}${C}## $* ${N}"; }
 
+# ─── Apple Silicon / Fedora Asahi Remix — wrong tool ─────────────────────────
+# This script edits GRUB defaults, BLS entries and command-line files and
+# regenerates grub.cfg; on Fedora Asahi Remix (iBoot -> m1n1 -> U-Boot -> GRUB)
+# that is the job of AsahiLocker's own post-encryption-setup.sh. linuxlocker.sh
+# refuses `post` there at the front door, but the README has you run this
+# script directly, so it refuses first, before anything else. The block is
+# identical to the one in luks-deploy.sh and luks-tune.sh, and
+# tests/uki-fixture-test.sh fails if any copy stops matching lib-deps.sh's
+# canonical ll_detect_asahi / ll_asahi_refuse.
+# --- asahi_guard ---
+if ! declare -F ll_detect_asahi >/dev/null || ! declare -F ll_asahi_refuse >/dev/null; then
+    LL_ASAHI_REASON=""
+    LL_ASAHILOCKER_URL="https://github.com/doug445/AsahiLocker"
+    ll_detect_asahi() {
+        local root="${1%/}" rel v d
+        LL_ASAHI_REASON=""
+        rel="$root/etc/os-release"
+        [ -r "$rel" ] || rel="$root/usr/lib/os-release"
+        if [ -r "$rel" ]; then
+            v=$(grep -Ei '^(NAME|PRETTY_NAME|VARIANT|VARIANT_ID|ID)=' "$rel" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            case "$v" in
+                *asahi*) LL_ASAHI_REASON="os-release identifies Fedora Asahi Remix"; return 0 ;;
+            esac
+        fi
+        for d in "$root"/usr/lib/modules/*asahi*/ "$root"/lib/modules/*asahi*/; do
+            [ -d "$d" ] || continue
+            LL_ASAHI_REASON="Asahi kernel installed ($(basename "$d"))"
+            return 0
+        done
+        for d in "$root"/boot/efi/m1n1 "$root"/etc/default/m1n1 "$root"/usr/lib/asahi-boot; do
+            [ -e "$d" ] || continue
+            LL_ASAHI_REASON="m1n1 / asahi boot components present (${d#"$root"})"
+            return 0
+        done
+        if [ -z "$root" ] && [ -r /proc/device-tree/compatible ]; then
+            if tr -d '\0' < /proc/device-tree/compatible 2>/dev/null | grep -q 'apple,'; then
+                LL_ASAHI_REASON="this machine is Apple Silicon (device-tree reports apple,*)"
+                return 0
+            fi
+        fi
+        return 1
+    }
+    ll_link() {
+        printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$2"
+    }
+    ll_asahi_refuse() {
+        echo ""
+        echo "╔════════════════════════════════════════════════════════════╗"
+        echo "║  WRONG TOOL — use AsahiLocker for Fedora Asahi Remix       ║"
+        echo "╚════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "  ${1:-Detected an Apple Silicon / Fedora Asahi Remix system.}"
+        [ -n "$LL_ASAHI_REASON" ] && echo "  Reason: $LL_ASAHI_REASON"
+        echo ""
+        echo "  LinuxLocker deliberately drops the Asahi boot guards, because on"
+        echo "  every other platform they are dead weight. Apple Silicon boots"
+        echo "  iBoot -> m1n1 -> U-Boot -> GRUB, and its stub partitions are read"
+        echo "  by the Apple firmware itself. Running this script here would"
+        echo "  misidentify the boot chain and could leave the machine unbootable"
+        echo "  in a way macOS recovery cannot fix for you."
+        echo ""
+        printf '  Use AsahiLocker instead:  '
+        ll_link "$LL_ASAHILOCKER_URL" "$LL_ASAHILOCKER_URL"
+        printf '\n\n'
+        echo "      git clone $LL_ASAHILOCKER_URL"
+        echo ""
+    }
+fi
+# --- end asahi_guard ---
+if ll_detect_asahi ""; then
+    ll_asahi_refuse "This machine is Apple Silicon / Fedora Asahi Remix."
+    exit 3
+fi
+
 [ "$(id -u)" -eq 0 ] || { err "run as root (sudo)"; exit 1; }
 
 SELFDIR=$(dirname "$(readlink -f "$0")")

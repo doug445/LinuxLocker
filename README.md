@@ -21,12 +21,19 @@ Arch, Manjaro, EndeavourOS and openSUSE. Converts LUKS1 to a LUKS2 container.
 > stub partitions are read by the Apple firmware itself; nothing here
 > understands that chain.
 >
-> You do not have to remember this. `linuxlocker.sh` and `luks-deploy.sh` both
-> detect Fedora Asahi Remix — from `VARIANT_ID`, an Asahi kernel, m1n1 boot
-> components, or an Apple Silicon device tree — and **exit before touching any
-> device**, with a link to AsahiLocker. The check runs against the live
-> environment *and* against the partition you select, because an Asahi disk can
-> be read from another machine.
+> You do not have to remember this. `linuxlocker.sh` (every action but the
+> read-only `diag` report), `luks-deploy.sh`, `luks-tune.sh` and
+> `post-encryption-setup.sh` detect Fedora Asahi Remix — from os-release, an
+> Asahi kernel, m1n1 boot components, or an Apple Silicon device tree — and
+> **exit before touching any device**, with a link to AsahiLocker. The last
+> three carry their own copy of that check, so it still fires when one of them
+> is copied somewhere without `lib-deps.sh`. Because an Asahi disk can be read
+> from another machine, `luks-deploy.sh` also checks the system on the
+> partition you select, mounted read-only, before anything on it is shrunk,
+> encrypted or reconfigured. On a partition that is already LUKS that check
+> comes only once it is unlocked for the configuration phase, so converting a
+> LUKS1 header, re-costing keyslots or finishing an interrupted encryption on
+> an Asahi disk is not caught by it — use AsahiLocker for those.
 
 `luks-deploy.sh` converts your existing root (or data) partition into a LUKS2
 container holding that same filesystem. Your files and the filesystem UUID
@@ -958,8 +965,10 @@ what stands in for it here:
 
 No — use **[AsahiLocker](https://github.com/doug445/AsahiLocker)**. It does the
 same job with the Apple Silicon boot guards LinuxLocker deliberately drops.
-Both `linuxlocker.sh` and `luks-deploy.sh` detect Fedora Asahi Remix and exit
-with a link before touching any device, so running the wrong one by mistake
+On the Mac itself, `luks-deploy.sh`, `luks-tune.sh`, `post-encryption-setup.sh`
+and every `linuxlocker.sh` action but the read-only `diag` report detect Fedora
+Asahi Remix and exit with a link before touching any device — the three scripts
+even when copied without `lib-deps.sh` — so running the wrong one by mistake
 costs you nothing.
 
 ### Can I run it unattended across several machines?

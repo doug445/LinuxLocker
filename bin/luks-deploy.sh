@@ -146,7 +146,8 @@ ask() {
 # ─── Shared dependency helpers (OS / package manager / installer) ────────────
 # Optional: if lib-deps.sh sits next to this script, missing filesystem tools
 # are auto-installed with the live distro's package manager; without it they
-# are simply reported as fatal with the package named.
+# are simply reported as fatal with the package named. The Apple Silicon
+# refusal below does NOT depend on it.
 LL_HAVE_DEPS_LIB=0
 if [ -f "$SCRIPT_DIR/lib-deps.sh" ]; then
     # shellcheck source=lib-deps.sh
@@ -154,6 +155,81 @@ if [ -f "$SCRIPT_DIR/lib-deps.sh" ]; then
     LL_HAVE_DEPS_LIB=1
     ll_detect_os
     ll_detect_pkg_mgr || true
+fi
+
+# ─── Apple Silicon / Fedora Asahi Remix — wrong tool, stop here ──────────────
+# Checked before ANY device is touched, and before any other file next to this
+# script is needed. AsahiLocker carries the boot guards this script
+# deliberately drops; running here risks an unbootable Mac.
+#
+# The refusal must never hinge on a file that was not copied along. lib-deps.sh
+# holds the canonical ll_detect_asahi / ll_asahi_refuse; when it is absent, or
+# too old to define them, the identical copy below stands in. luks-tune.sh and
+# post-encryption-setup.sh carry the same block, and tests/uki-fixture-test.sh
+# fails if any copy stops matching lib-deps.sh.
+# --- asahi_guard ---
+if ! declare -F ll_detect_asahi >/dev/null || ! declare -F ll_asahi_refuse >/dev/null; then
+    LL_ASAHI_REASON=""
+    LL_ASAHILOCKER_URL="https://github.com/doug445/AsahiLocker"
+    ll_detect_asahi() {
+        local root="${1%/}" rel v d
+        LL_ASAHI_REASON=""
+        rel="$root/etc/os-release"
+        [ -r "$rel" ] || rel="$root/usr/lib/os-release"
+        if [ -r "$rel" ]; then
+            v=$(grep -Ei '^(NAME|PRETTY_NAME|VARIANT|VARIANT_ID|ID)=' "$rel" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            case "$v" in
+                *asahi*) LL_ASAHI_REASON="os-release identifies Fedora Asahi Remix"; return 0 ;;
+            esac
+        fi
+        for d in "$root"/usr/lib/modules/*asahi*/ "$root"/lib/modules/*asahi*/; do
+            [ -d "$d" ] || continue
+            LL_ASAHI_REASON="Asahi kernel installed ($(basename "$d"))"
+            return 0
+        done
+        for d in "$root"/boot/efi/m1n1 "$root"/etc/default/m1n1 "$root"/usr/lib/asahi-boot; do
+            [ -e "$d" ] || continue
+            LL_ASAHI_REASON="m1n1 / asahi boot components present (${d#"$root"})"
+            return 0
+        done
+        if [ -z "$root" ] && [ -r /proc/device-tree/compatible ]; then
+            if tr -d '\0' < /proc/device-tree/compatible 2>/dev/null | grep -q 'apple,'; then
+                LL_ASAHI_REASON="this machine is Apple Silicon (device-tree reports apple,*)"
+                return 0
+            fi
+        fi
+        return 1
+    }
+    ll_link() {
+        printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$2"
+    }
+    ll_asahi_refuse() {
+        echo ""
+        echo "╔════════════════════════════════════════════════════════════╗"
+        echo "║  WRONG TOOL — use AsahiLocker for Fedora Asahi Remix       ║"
+        echo "╚════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "  ${1:-Detected an Apple Silicon / Fedora Asahi Remix system.}"
+        [ -n "$LL_ASAHI_REASON" ] && echo "  Reason: $LL_ASAHI_REASON"
+        echo ""
+        echo "  LinuxLocker deliberately drops the Asahi boot guards, because on"
+        echo "  every other platform they are dead weight. Apple Silicon boots"
+        echo "  iBoot -> m1n1 -> U-Boot -> GRUB, and its stub partitions are read"
+        echo "  by the Apple firmware itself. Running this script here would"
+        echo "  misidentify the boot chain and could leave the machine unbootable"
+        echo "  in a way macOS recovery cannot fix for you."
+        echo ""
+        printf '  Use AsahiLocker instead:  '
+        ll_link "$LL_ASAHILOCKER_URL" "$LL_ASAHILOCKER_URL"
+        printf '\n\n'
+        echo "      git clone $LL_ASAHILOCKER_URL"
+        echo ""
+    }
+fi
+# --- end asahi_guard ---
+if ll_detect_asahi ""; then
+    ll_asahi_refuse "This live environment is running on Apple Silicon / Fedora Asahi Remix."
+    exit 3
 fi
 
 # ─── UKI / systemd-boot / Secure Boot support ────────────────────────────────
@@ -173,14 +249,6 @@ fi
     || fatal "lib-boot.sh not found next to this script — the bin/ directory is incomplete."
 # shellcheck source=lib-boot.sh
 . "$SCRIPT_DIR/lib-boot.sh"
-
-# ─── Apple Silicon / Fedora Asahi Remix — wrong tool, stop here ──────────────
-# Checked before ANY device is touched. AsahiLocker carries the boot guards
-# this script deliberately drops; running here risks an unbootable Mac.
-if [ "$LL_HAVE_DEPS_LIB" -eq 1 ] && ll_detect_asahi ""; then
-    ll_asahi_refuse "This live environment is running on Apple Silicon / Fedora Asahi Remix."
-    exit 3
-fi
 
 # ─── Permissions on the deployment drive ─────────────────────────────────────
 # chmod(2) SUCCEEDS and does nothing on vfat/exfat/ntfs: the mode comes from the
@@ -1787,7 +1855,7 @@ if [ "$SYSTEM_MODE" -eq 1 ]; then
     # The TARGET may be Fedora Asahi Remix even when the live environment is
     # not (an Asahi disk read from another machine, a rescue image that does
     # not identify itself). ID=fedora, so only the variant fields catch it.
-    if [ "$LL_HAVE_DEPS_LIB" -eq 1 ] && ll_detect_asahi "/mnt_temp/${SUBPATH%/}"; then
+    if ll_detect_asahi "/mnt_temp/${SUBPATH%/}"; then
         ll_asahi_refuse "The partition you selected holds a Fedora Asahi Remix install."
         exit 3
     fi
