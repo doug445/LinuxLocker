@@ -773,7 +773,7 @@ before "... before its LUKS header decides the mode" "$D" "$SEL" "if blkid \"\$T
 before "... before a LUKS1 conversion" "$D" "$SEL" 'convert_luks1 "$TARGET_ROOT"'
 before "... before the hand-off to luks-tune.sh" "$D" "$SEL" 'exec "$SCRIPT_DIR/luks-tune.sh"'
 before "... before an interrupted encryption is resumed" "$D" "$SEL" 'cryptsetup reencrypt --resume-only --verbose'
-before "... before the discovery mount" "$D" "$SEL" 'mount -o subvolid=5,ro "$DISCOVERY_DEV"'
+before "... before the discovery mount" "$D" "$SEL" 'll_ro_mount "$DISCOVERY_DEV" /mnt_temp subvolid=5'
 before "luks-deploy.sh: a mapper an earlier run left open is checked before it is unmounted" "$D" 'll_detect_asahi_dev "$STALE_BACKING"' 'umount -R /mnt 2>/dev/null'
 before "luks-deploy.sh: the inside of a LUKS1 volume is checked before its header is converted" "$D" 'if ll_detect_asahi "/mnt_temp/${psub%/}"' 'cryptsetup convert --type luks2 --batch-mode'
 before "luks-tune.sh: the volume picked is checked before its header is backed up" "$T" 'll_detect_asahi_dev "$DEV"' '"$CRYPTSETUP" luksHeaderBackup'
@@ -848,6 +848,95 @@ else
     else
         skip "cannot read the live UKI's .cmdline (needs root, or no objcopy)"
     fi
+fi
+
+# ─── 11. --dry-run: read-only mounts, and a cleanup that undoes only its own ─
+# A dry run writes nothing to the target. Two pieces of luks-deploy.sh carry
+# that and can be run here without root, cut out by their markers, with the
+# commands they call replaced by recorders:
+#   ll_ro_mount  a read-only mount that, in a dry run, also replays no journal
+#                (a plain "ro" mount of a dirty ext3/4, xfs, btrfs or f2fs
+#                writes the replay to the device); plain "ro" in a real run
+#   cleanup      the exit trap: a dry run must not unmount anything under
+#                /mnt, delete anything there, or close a mapper it did not
+#                open; a real run cleans up exactly as before
+# The loopback suite runs the whole script against real devices (section 12).
+echo ""
+echo "[11] --dry-run: read-only mounts that replay no journal, and its exit cleanup"
+DRY_BLOCK=$(sed -n '/^# --- ll_ro_mount ---$/,/^# --- end ll_ro_mount ---$/p' "$REPO/bin/luks-deploy.sh")
+if [ -z "$DRY_BLOCK" ]; then
+    fail "luks-deploy.sh has no '# --- ll_ro_mount ---' block"
+else
+    ro_calls() {   # $1 = DRY_RUN, $2 = blkid TYPE, $3 = extra options, $4 = 1 if rescue= is refused -> mount calls
+        env -u BASH_ENV bash -c 'eval "$1"; DRY_RUN="$2"; FS="$3"; OLD="$5"
+            blkid() { printf "%s\n" "$FS"; }
+            mount() { echo "mount $*"; case "$*" in *rescue=*) [ "$OLD" = 1 ] && return 32 ;; esac; return 0; }
+            ll_ro_mount /dev/fixture /fixture-dir "$4"' _ "$DRY_BLOCK" "$1" "$2" "$3" "${4:-0}" 2>&1 | paste -sd';'
+    }
+    for c in "1|ext4||mount -o ro,noload /dev/fixture /fixture-dir" \
+             "1|ext3||mount -o ro,noload /dev/fixture /fixture-dir" \
+             "1|xfs||mount -o ro,norecovery /dev/fixture /fixture-dir" \
+             "1|f2fs||mount -o ro,norecovery /dev/fixture /fixture-dir" \
+             "1|btrfs|subvolid=5|mount -o ro,rescue=nologreplay,subvolid=5 /dev/fixture /fixture-dir" \
+             "1|ext2||mount -o ro /dev/fixture /fixture-dir" \
+             "1|vfat||mount -o ro /dev/fixture /fixture-dir" \
+             "1|ntfs||mount -o ro /dev/fixture /fixture-dir" \
+             "0|ext4||mount -o ro /dev/fixture /fixture-dir" \
+             "0|btrfs|subvolid=5|mount -o ro,subvolid=5 /dev/fixture /fixture-dir"; do
+        IFS='|' read -r d fs extra want <<< "$c"
+        what="$( [ "$d" = 1 ] && echo "dry run" || echo "real run"), $fs${extra:+ ($extra)}"
+        eq "ll_ro_mount, $what" "$want" "$(ro_calls "$d" "$fs" "$extra" 0)"
+    done
+    eq "ll_ro_mount, dry run, btrfs on a kernel without rescue=: falls back to nologreplay" \
+       "mount -o ro,rescue=nologreplay,subvolid=5 /dev/fixture /fixture-dir;mount -o ro,nologreplay,subvolid=5 /dev/fixture /fixture-dir" \
+       "$(ro_calls 1 btrfs subvolid=5 1)"
+fi
+D="$REPO/bin/luks-deploy.sh"
+for plain in 'mount -o subvolid=5,ro "$DISCOVERY_DEV"' 'mount -o ro "$DISCOVERY_DEV"' 'mount -o ro "$TARGET_BOOT"'; do
+    if grep -qF -- "$plain" "$D"; then fail "luks-deploy.sh still mounts with a plain '$plain' (replays a journal in a dry run)"
+    else pass "discovery no longer does '$plain' — it goes through ll_ro_mount"; fi
+done
+if grep -q 'declare -F ll_ro_mount' "$REPO/bin/lib-uki.sh"; then
+    pass "lib-uki.sh's uki_probe_dev mounts through ll_ro_mount when the caller has one"
+else
+    fail "lib-uki.sh's uki_probe_dev still mounts /boot with a plain 'ro'"
+fi
+CLEAN_BLOCK=$(sed -n '/^# --- cleanup ---$/,/^# --- end cleanup ---$/p' "$D")
+if [ -z "$CLEAN_BLOCK" ]; then
+    fail "luks-deploy.sh has no '# --- cleanup ---' block"
+else
+    cleanup_calls() {   # $1 = DRY_RUN, $2 = MNT_TEMP_MOUNTED_HERE, $3 = MAPPER_OPENED_HERE, $4 = exit status -> what it ran
+        env -u BASH_ENV bash -c 'eval "$1"
+            DRY_RUN="$2"; MNT_TEMP_MOUNTED_HERE="$3"; MAPPER_OPENED_HERE="$4"
+            LUKS_NAME=root_crypt; SCRIPT_DIR=/deploy; DEPLOY_LOG=/deploy/log
+            umount()     { echo "umount $*"; }
+            cryptsetup() { echo "cryptsetup $*"; }
+            rm()         { echo "rm $*"; }
+            rmdir()      { :; }
+            sync()       { :; }
+            sleep()      { :; }
+            err()        { :; }
+            ( exit "$5" ); cleanup' _ "$CLEAN_BLOCK" "$1" "$2" "$3" "$4" 2>&1 | grep -E '^(umount|cryptsetup|rm) ' | grep -v 'luks-.*-probe\.' | paste -sd';'
+    }
+    GOT=$(cleanup_calls 1 0 0 0)
+    case "$GOT" in
+        *"umount /mnt"[\ /\;]*|*"umount /mnt") fail "dry-run cleanup unmounts under /mnt: $GOT" ;;
+        *"rm "*) fail "dry-run cleanup deletes something: $GOT" ;;
+        *"cryptsetup close root_crypt"*) fail "dry-run cleanup closes a mapper it did not open: $GOT" ;;
+        "cryptsetup close luks-probe-"*) pass "dry-run cleanup with nothing of its own: only its own probe mapper, nothing under /mnt" ;;
+        *) fail "dry-run cleanup did something unexpected: $GOT" ;;
+    esac
+    GOT=$(cleanup_calls 1 1 1 1)
+    case "$GOT" in
+        *"umount /mnt;"*|*"umount /mnt/"*|*"umount /mnt") fail "dry-run cleanup unmounts under /mnt: $GOT" ;;
+        "umount -R /mnt_temp;cryptsetup close luks-probe-"*";cryptsetup close root_crypt") pass "dry-run cleanup undoes its own /mnt_temp mount and the mapper it opened, nothing else" ;;
+        *) fail "dry-run cleanup of its own mounts went wrong: $GOT" ;;
+    esac
+    GOT=$(cleanup_calls 0 0 0 1)
+    case "$GOT" in
+        *"umount /mnt;"*"cryptsetup close root_crypt;"*"rm -f /mnt/tmp/.luks-deploy-env"*) pass "a real run's cleanup is unchanged: chroot mounts, /mnt, the mapper, the chroot scripts" ;;
+        *) fail "a real run's cleanup changed: $GOT" ;;
+    esac
 fi
 
 # ─── Result ──────────────────────────────────────────────────────────────────

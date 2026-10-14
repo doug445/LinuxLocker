@@ -89,9 +89,12 @@ boot machinery, and shows you what it found. You confirm the selection, type
 `ENCRYPT`, and choose a passphrase. Everything after that is automated,
 including recovery if a step fails partway.
 
-`--dry-run` runs the entire read-only half — detection, cross-checks, KDF
-benchmark, the exact `cryptsetup` command it would issue — and exits before
-the point of no return.
+`--dry-run` runs the read-only half — detection, cross-checks, KDF benchmark,
+the exact `cryptsetup` command it would issue — and exits before the point of
+no return, writing nothing to the target. A step that would change something
+sooner (finishing an interrupted encryption, converting a LUKS1 header,
+handing over to `luks-tune.sh`) is not taken: the dry run says what it would
+do and stops there.
 
 ---
 
@@ -729,8 +732,8 @@ you, and the part that differs on every distro:
 | Undo / recovery | Whatever you thought to save | Header backups plus a labeled bundle of every changed file, with distro-specific repair commands |
 
 If you want to understand what it changes before trusting it, `--dry-run`
-prints every action, including the exact `cryptsetup` invocation, and changes
-nothing.
+prints what it would do, including the exact `cryptsetup` invocation, and
+changes nothing.
 
 ---
 

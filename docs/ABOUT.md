@@ -104,9 +104,12 @@ work. The same entry point handles a plain filesystem, an interrupted run, a
 finished LUKS2 volume and a LUKS1 volume — you never have to know which state
 you are in.
 
-**`--dry-run` is real.** It runs the entire read-only half — detection, the
-fstab cross-check, the KDF benchmark, and the exact `cryptsetup` invocation it
-would issue — and exits before the point of no return.
+**`--dry-run` is real.** It runs the read-only half — detection, the fstab
+cross-check, the KDF benchmark, and the exact `cryptsetup` invocation it would
+issue — and exits before the point of no return without writing to the
+target: its mounts are read-only and replay no journal, and a step that would
+change something sooner, such as finishing an interrupted encryption, is
+described and not taken.
 
 ## What it deliberately does not do
 

@@ -69,8 +69,9 @@ of the inner filesystem, boot configuration, initramfs rebuilds, and the
 final verification gate. **Do not reboot if the gate reports errors** — it
 prints exactly what failed.
 
-Want a rehearsal first? `sudo ./bin/linuxlocker.sh deploy --dry-run` runs all
-of the detection and prints the exact plan, changing nothing.
+Want a rehearsal first? `sudo ./bin/linuxlocker.sh deploy --dry-run` runs the
+detection and prints the plan, changing nothing; where a step would have to
+change something first, it says what that step would do and stops there.
 
 ## 4. First boot
 
