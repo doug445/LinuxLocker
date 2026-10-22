@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/doug445/LinuxLocker/actions/workflows/lint.yml/badge.svg)](https://github.com/doug445/LinuxLocker/actions/workflows/lint.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Free and open source](https://img.shields.io/badge/Free%20and%20open%20source-brightgreen.svg)](LICENSE)
 [![Platform: x86_64 | aarch64](https://img.shields.io/badge/platform-x86__64%20%7C%20aarch64-lightgrey.svg)](#requirements)
 [![KDF: argon2id](https://img.shields.io/badge/KDF-argon2id-blue.svg)](#kdf-profiles--argon2id-only)
 [![Boot: GRUB | systemd-boot | UKI](https://img.shields.io/badge/boot-GRUB%20%7C%20systemd--boot%20%7C%20UKI-informational.svg)](docs/BOOTLOADERS.md)
